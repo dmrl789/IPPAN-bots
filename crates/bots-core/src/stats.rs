@@ -54,13 +54,6 @@ impl LatencyHistogram {
         }
         self.max_ms
     }
-
-    pub fn snapshot(&self) -> Vec<u64> {
-        self.buckets
-            .iter()
-            .map(|b| b.load(Ordering::Relaxed))
-            .collect()
-    }
 }
 
 impl Default for LatencyHistogram {

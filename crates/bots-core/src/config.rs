@@ -23,9 +23,9 @@ impl Config {
 pub struct ScenarioConfig {
     /// Deterministic seed for reproducible payload generation
     pub seed: u64,
-    /// Desired payload size in bytes (used to deterministically pad memo/body)
+    /// Desired payload size in bytes (used to deterministically pad memo)
     pub payload_bytes: u32,
-    /// Base memo string (will be capped to 256 bytes at runtime)
+    /// Base memo string (worker caps to 256 bytes)
     pub memo: String,
 }
 
@@ -63,19 +63,22 @@ pub enum ToMode {
 pub struct PaymentConfig {
     pub from: String,
     pub to_mode: ToMode,
-    /// Optional path to a newline-delimited list of recipients.
+    /// Path to a newline-delimited list of recipients.
     /// - `round_robin`: cycle through recipients
     /// - `single`: always use the first recipient
     #[serde(default)]
     pub to_list_path: Option<String>,
-    pub amount: u128,
+    /// Amount as a decimal string (parsed to `u128` at runtime).
+    ///
+    /// We keep this as a string because `toml` numeric decoding does not support `u128`.
+    pub amount: String,
     /// Custodial signing key passed to `/tx/payment` (test keys only)
     pub signing_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerConfig {
-    /// List of worker hostnames or addresses
+    /// List of worker hostnames or addresses (for SSH script orchestration)
     pub worker_hosts: Vec<String>,
 }
 
@@ -104,17 +107,18 @@ max_in_flight = 1000
 from = "from1"
 to_mode = "single"
 to_list_path = "secrets/to_list.txt"
-amount = 123
+amount = "123"
 signing_key = "test_key"
         "#;
 
         let config: Config = toml::from_str(config_str).unwrap();
         assert_eq!(config.scenario.seed, 42);
         assert_eq!(config.scenario.payload_bytes, 512);
+        assert_eq!(config.scenario.memo, "hello");
         assert_eq!(config.ramp.steps.len(), 1);
         assert_eq!(config.ramp.steps[0].tps, 1000);
         assert_eq!(config.payment.from, "from1");
         assert_eq!(config.payment.to_mode, ToMode::Single);
-        assert_eq!(config.payment.amount, 123);
+        assert_eq!(config.payment.amount, "123");
     }
 }

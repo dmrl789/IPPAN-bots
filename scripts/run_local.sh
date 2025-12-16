@@ -1,17 +1,26 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "=== Building IPPAN Load Robot ==="
-cargo build --release
+# Run a single local worker in mock mode, then HTTP mode
+
+echo "=== Building release binary ==="
+cargo build --release --bin worker
 
 echo ""
-echo "=== Running Worker in Mock Mode ==="
+echo "=== Running worker in MOCK mode (5 second test) ==="
 cargo run --release --bin worker -- \
-  --config config/example.local.toml \
+  --config config/test.toml \
   --mode mock \
-  --worker-id local-worker-1 \
+  --worker-id worker-mock-test \
   --print-every-ms 1000
 
 echo ""
-echo "=== Run Complete ==="
-echo "Check results/ directory for output files"
+echo "=== Mock run complete ==="
+echo "Results written to results/worker_mock-test_*.json"
+
+echo ""
+echo "=== To run against real HTTP endpoint, update config and run: ==="
+echo "cargo run --release --bin worker -- \\"
+echo "  --config config/example.local.toml \\"
+echo "  --mode http \\"
+echo "  --worker-id worker-1"

@@ -87,7 +87,6 @@ async fn main() -> Result<()> {
         config.clone(),
         args.mode.clone(),
         args.worker_id.clone(),
-        run_id.clone(),
         args.print_every_ms,
     )
     .await?;
@@ -105,13 +104,20 @@ async fn run_load_test(
     config: Config,
     mode: String,
     worker_id: String,
-    _run_id: String,
     print_every_ms: u64,
 ) -> Result<WorkerResult> {
     let start_time = std::time::Instant::now();
     let stats = Arc::new(StatsCollector::new());
 
-    let recipients = load_recipients(&config)?;
+    let amount: u128 = config.payment.amount.parse().with_context(|| {
+        format!(
+            "payment.amount must be a base-10 u128 string, got {:?}",
+            config.payment.amount
+        )
+    })?;
+
+    let config = Arc::new(config);
+    let recipients = Arc::new(load_recipients(config.as_ref())?);
     info!(
         "Recipients loaded: {} (to_mode={:?})",
         recipients.len(),
@@ -171,18 +177,18 @@ async fn run_load_test(
             window.step_idx, window.tps, hold_ms
         );
 
-        run_ramp_step(
-            &config,
-            &recipients,
-            submitter.clone(),
-            stats.clone(),
-            semaphore.clone(),
-            url_idx.clone(),
-            to_idx.clone(),
-            window.tps,
-            hold_ms,
-        )
-        .await?;
+        let env = StepEnv {
+            config: config.clone(),
+            recipients: recipients.clone(),
+            submitter: submitter.clone(),
+            stats: stats.clone(),
+            semaphore: semaphore.clone(),
+            url_idx: url_idx.clone(),
+            to_idx: to_idx.clone(),
+            amount,
+        };
+
+        run_ramp_step(&env, window.tps, hold_ms).await?;
     }
 
     info!("Waiting for in-flight requests to complete...");
@@ -218,17 +224,17 @@ async fn run_load_test(
 }
 
 #[derive(Debug, Serialize)]
-struct PaymentBody<'a> {
-    from: &'a str,
-    to: &'a str,
+struct PaymentBody {
+    from: String,
+    to: String,
     amount: u128,
-    signing_key: &'a str,
+    signing_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     fee: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nonce: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    memo: Option<&'a str>,
+    memo: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,7 +254,7 @@ trait PaymentSubmitter: Send + Sync {
     fn submit_payment<'a>(
         &'a self,
         base_url: &'a str,
-        body: &'a PaymentBody<'a>,
+        body: &'a PaymentBody,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>>;
 }
 
@@ -266,7 +272,7 @@ impl PaymentSubmitter for MockPaymentSubmitter {
     fn submit_payment<'a>(
         &'a self,
         _base_url: &'a str,
-        _body: &'a PaymentBody<'a>,
+        _body: &'a PaymentBody,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -305,7 +311,7 @@ impl PaymentSubmitter for HttpPaymentSubmitter {
     fn submit_payment<'a>(
         &'a self,
         base_url: &'a str,
-        body: &'a PaymentBody<'a>,
+        body: &'a PaymentBody,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -366,17 +372,18 @@ impl PaymentSubmitter for HttpPaymentSubmitter {
     }
 }
 
-async fn run_ramp_step(
-    config: &Config,
-    recipients: &[String],
+struct StepEnv {
+    config: Arc<Config>,
+    recipients: Arc<Vec<String>>,
     submitter: Arc<dyn PaymentSubmitter>,
     stats: Arc<StatsCollector>,
     semaphore: Arc<Semaphore>,
     url_idx: Arc<AtomicUsize>,
     to_idx: Arc<AtomicUsize>,
-    tps: u64,
-    hold_ms: u64,
-) -> Result<()> {
+    amount: u128,
+}
+
+async fn run_ramp_step(env: &StepEnv, tps: u64, hold_ms: u64) -> Result<()> {
     let step_start = tokio::time::Instant::now();
     let step_end = step_start + Duration::from_millis(hold_ms);
 
@@ -404,34 +411,38 @@ async fn run_ramp_step(
         }
 
         while to_launch > 0 {
-            let permit = semaphore.clone().acquire_owned().await?;
-            stats.record_attempted(1);
-            stats.record_sent(1);
+            let permit = env.semaphore.clone().acquire_owned().await?;
+            env.stats.record_attempted(1);
+            env.stats.record_sent(1);
 
-            let base_url = choose_round_robin(&config.target.rpc_urls, &url_idx);
-            let to = choose_recipient(config.payment.to_mode, recipients, &to_idx);
+            let base_url = choose_round_robin(&env.config.target.rpc_urls, &env.url_idx);
+            let to = choose_recipient(
+                env.config.payment.to_mode,
+                env.recipients.as_ref(),
+                &env.to_idx,
+            );
             let memo = build_memo(
-                &config.scenario.memo,
-                config.scenario.payload_bytes,
-                config.scenario.seed,
+                &env.config.scenario.memo,
+                env.config.scenario.payload_bytes,
+                env.config.scenario.seed,
                 seq,
             );
 
             let body = PaymentBody {
-                from: &config.payment.from,
+                from: env.config.payment.from.clone(),
                 to,
-                amount: config.payment.amount,
-                signing_key: &config.payment.signing_key,
+                amount: env.amount,
+                signing_key: env.config.payment.signing_key.clone(),
                 fee: None,
                 nonce: None,
-                memo: Some(&memo),
+                memo: Some(memo),
             };
 
-            let submitter = submitter.clone();
-            let stats = stats.clone();
+            let submitter = env.submitter.clone();
+            let stats = env.stats.clone();
             tokio::spawn(async move {
                 let _permit: OwnedSemaphorePermit = permit;
-                match submitter.submit_payment(base_url, &body).await {
+                match submitter.submit_payment(&base_url, &body).await {
                     Ok(outcome) => match outcome.kind {
                         OutcomeKind::Accepted => stats.record_accepted(1, outcome.latency_ms),
                         OutcomeKind::Rejected => stats.record_rejected(1, outcome.latency_ms),
@@ -490,24 +501,24 @@ fn load_recipients(config: &Config) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn choose_round_robin<'a>(items: &'a [String], idx: &AtomicUsize) -> &'a str {
+fn choose_round_robin(items: &[String], idx: &AtomicUsize) -> String {
     let i = idx.fetch_add(1, Ordering::Relaxed);
-    &items[i % items.len()]
+    items[i % items.len()].clone()
 }
 
-fn choose_recipient<'a>(mode: ToMode, recipients: &'a [String], idx: &AtomicUsize) -> &'a str {
+fn choose_recipient(mode: ToMode, recipients: &[String], idx: &AtomicUsize) -> String {
     match mode {
-        ToMode::Single => &recipients[0],
+        ToMode::Single => recipients[0].clone(),
         ToMode::RoundRobin => {
             let i = idx.fetch_add(1, Ordering::Relaxed);
-            &recipients[i % recipients.len()]
+            recipients[i % recipients.len()].clone()
         }
     }
 }
 
 fn build_memo(base: &str, payload_bytes: u32, seed: u64, seq: u64) -> String {
     // Memo is capped to 256 bytes; payload_bytes beyond that has no effect.
-    let target = (payload_bytes as usize).min(256).max(1);
+    let target = (payload_bytes as usize).clamp(1, 256);
 
     // Deterministic, cheap, and stable: base + `|seed=<seed>|seq=<seq>|` then 'a' padding.
     let mut s = String::new();
@@ -520,7 +531,6 @@ fn build_memo(base: &str, payload_bytes: u32, seed: u64, seq: u64) -> String {
     s.push_str("|seq=");
     s.push_str(&seq.to_string());
 
-    // Ensure byte-length target (not char-length). We only add ASCII, so this is safe.
     while s.as_bytes().len() < target {
         s.push('a');
     }

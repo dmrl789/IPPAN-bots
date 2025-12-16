@@ -88,9 +88,7 @@ async fn main() -> Result<()> {
 
     let local_n = args.local.unwrap_or(0);
     if local_n == 0 {
-        info!(
-            "No --local N provided. For SSH-based orchestration, use scripts/run_cluster_ssh.sh"
-        );
+        info!("No --local N provided. For SSH-based orchestration, use scripts/run_cluster_ssh.sh");
         return Ok(());
     }
 
@@ -208,7 +206,6 @@ fn infer_worker_binary() -> Result<PathBuf> {
         return Ok(candidate);
     }
 
-    // Fall back to common locations.
     for p in ["target/release/worker", "target/debug/worker"] {
         let pb = PathBuf::from(p);
         if pb.exists() {
@@ -233,6 +230,7 @@ fn collect_worker_results(run_id: &str) -> Result<Vec<WorkerResult>> {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
+
         let name = match path.file_name().and_then(|s| s.to_str()) {
             Some(n) => n,
             None => continue,
