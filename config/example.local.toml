@@ -1,0 +1,44 @@
+# Example configuration for local single-worker testing
+
+[scenario]
+# Deterministic seed for reproducible runs
+seed = 42
+
+# Optional global duration cap (comment out for unlimited)
+# duration_ms = 60000
+
+# Fixed payload size in bytes
+payload_bytes = 512
+
+# Maximum transactions per batch (0 or 1 = no batching)
+batch_max = 10
+
+# Ramp schedule: gradually increase TPS
+[[ramp.steps]]
+tps = 1000
+hold_ms = 10000
+
+[[ramp.steps]]
+tps = 5000
+hold_ms = 10000
+
+[[ramp.steps]]
+tps = 10000
+hold_ms = 20000
+
+[target]
+# RPC endpoints (worker will round-robin)
+rpc_urls = ["http://127.0.0.1:8080"]
+
+# Request timeout in milliseconds
+timeout_ms = 5000
+
+# Maximum concurrent in-flight requests
+max_in_flight = 1000
+
+[worker]
+# Worker identifier
+id = "worker-1"
+
+# Metrics endpoint binding (optional)
+bind_metrics = "127.0.0.1:9100"

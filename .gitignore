@@ -1,5 +1,7 @@
 # Rust
 /target/
+target/
+Cargo.lock
 
 # Outputs
 *.log
@@ -21,7 +23,13 @@ results/
 results/**
 !results/.gitkeep
 
-# OS/editor
-.DS_Store
-.vscode/
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,54 @@
+# Example configuration for multi-worker cluster deployment
+
+[scenario]
+# Deterministic seed for reproducible runs
+seed = 42
+
+# Fixed payload size in bytes
+payload_bytes = 512
+
+# Maximum transactions per batch
+batch_max = 10
+
+# Aggressive ramp schedule for cluster testing
+[[ramp.steps]]
+tps = 10000
+hold_ms = 30000
+
+[[ramp.steps]]
+tps = 50000
+hold_ms = 30000
+
+[[ramp.steps]]
+tps = 100000
+hold_ms = 60000
+
+[target]
+# Multiple RPC endpoints for load balancing
+rpc_urls = [
+    "http://node-1:8080",
+    "http://node-2:8080",
+    "http://node-3:8080",
+]
+
+# Request timeout in milliseconds
+timeout_ms = 5000
+
+# Maximum concurrent in-flight requests per worker
+max_in_flight = 2000
+
+[worker]
+# Default worker identifier (will be overridden by controller)
+id = "worker-default"
+
+# Metrics endpoint binding
+bind_metrics = "0.0.0.0:9100"
+
+[controller]
+# Worker hostnames or IP addresses
+worker_hosts = [
+    "node-bot-1",
+    "node-bot-2",
+    "node-bot-3",
+    "node-bot-4",
+]

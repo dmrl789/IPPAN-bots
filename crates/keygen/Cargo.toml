@@ -1,0 +1,15 @@
+[package]
+name = "keygen"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "keygen"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
