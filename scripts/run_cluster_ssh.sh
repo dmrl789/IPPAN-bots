@@ -18,7 +18,11 @@ echo "=== Building release binary ==="
 cargo build --release --bin worker
 
 BINARY="target/release/worker"
-WORKER_HOSTS=("bot-server-1" "bot-server-2" "bot-server-3" "bot-server-4")  # Update with your hosts
+if [ -n "${WORKER_HOSTS:-}" ]; then
+  IFS=',' read -r -a WORKER_HOSTS <<< "${WORKER_HOSTS}"
+else
+  WORKER_HOSTS=("bot-server-1" "bot-server-2" "bot-server-3" "bot-server-4")  # set WORKER_HOSTS=host1,host2,host3,host4
+fi
 
 echo ""
 echo "=== Deploying to worker hosts ==="

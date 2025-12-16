@@ -1,6 +1,18 @@
 # Rust
 /target/
 target/
+
+# Spec-required ignores (verbatim)
+target/
+keys/
+secrets/
+results/
+runs/
+*.log
+*.json
+*.jsonl
+*.csv
+.env
 Cargo.lock
 
 # Outputs

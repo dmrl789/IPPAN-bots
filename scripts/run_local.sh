@@ -5,7 +5,7 @@ set -euo pipefail
 # Generates a throwaway recipients file if missing.
 
 WORKERS=${1:-4}
-CONFIG=${2:-config/example.local.toml}
+CONFIG=${2:-config/example.deventer.toml}
 
 mkdir -p keys results runs
 
