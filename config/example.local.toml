@@ -7,11 +7,8 @@ seed = 42
 # Optional global duration cap (comment out for unlimited)
 # duration_ms = 60000
 
-# Fixed payload size in bytes
-payload_bytes = 512
-
-# Maximum transactions per batch (0 or 1 = no batching)
-batch_max = 10
+# Optional memo string (will be truncated to 256 bytes)
+memo = "load-test"
 
 # Ramp schedule: gradually increase TPS
 [[ramp.steps]]
@@ -28,13 +25,35 @@ hold_ms = 20000
 
 [target]
 # RPC endpoints (worker will round-robin)
+# Port 8080 is the HTTP API (used by bots)
+# Port 9000 is node-to-node P2P (NOT used by bots)
 rpc_urls = ["http://127.0.0.1:8080"]
 
 # Request timeout in milliseconds
 timeout_ms = 5000
 
 # Maximum concurrent in-flight requests
-max_in_flight = 1000
+max_in_flight = 10000
+
+[payment]
+# Source address (use test key only!)
+from = "test_from_address_placeholder"
+
+# Destination mode: "single" or "round_robin"
+to_mode = "single"
+
+# For single mode: single destination address
+to_single = "test_to_address_placeholder"
+
+# For round_robin mode: path to file with list of addresses (one per line)
+# to_list_path = "keys/recipient_addresses.txt"
+
+# Payment amount (u128 as string)
+amount = "1000"
+
+# Signing key (CUSTODIAL SIGNING - use test key only!)
+# This is for /tx/payment endpoint (server-side signing)
+signing_key = "test_signing_key_placeholder"
 
 [worker]
 # Worker identifier

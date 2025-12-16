@@ -1,19 +1,23 @@
-# Example configuration for multi-worker cluster deployment
+# Example configuration for cluster/distributed testing
 
 [scenario]
 # Deterministic seed for reproducible runs
-seed = 42
+seed = 12345
 
-# Fixed payload size in bytes
-payload_bytes = 512
+# Optional global duration cap
+# duration_ms = 300000
 
-# Maximum transactions per batch
-batch_max = 10
+# Optional memo string
+memo = "cluster-load-test"
 
-# Aggressive ramp schedule for cluster testing
+# Ramp schedule: aggressive ramp for cluster testing
+[[ramp.steps]]
+tps = 1000
+hold_ms = 10000
+
 [[ramp.steps]]
 tps = 10000
-hold_ms = 30000
+hold_ms = 20000
 
 [[ramp.steps]]
 tps = 50000
@@ -24,31 +28,54 @@ tps = 100000
 hold_ms = 60000
 
 [target]
-# Multiple RPC endpoints for load balancing
+# Multiple RPC endpoints (worker will round-robin)
+# Replace with your actual IPPAN node API endpoints
 rpc_urls = [
-    "http://node-1:8080",
-    "http://node-2:8080",
-    "http://node-3:8080",
+    "http://node1:8080",
+    "http://node2:8080",
+    "http://node3:8080"
 ]
 
 # Request timeout in milliseconds
 timeout_ms = 5000
 
-# Maximum concurrent in-flight requests per worker
-max_in_flight = 2000
+# Maximum concurrent in-flight requests (tune based on worker server capacity)
+max_in_flight = 50000
+
+[payment]
+# Source address (use test key only!)
+from = "test_from_address_placeholder"
+
+# Destination mode: "round_robin" for distributed load
+to_mode = "round_robin"
+
+# Path to file with recipient addresses (one per line)
+to_list_path = "keys/recipient_addresses.txt"
+
+# For single mode (alternative):
+# to_mode = "single"
+# to_single = "test_to_address_placeholder"
+
+# Payment amount
+amount = "1000"
+
+# Signing key (CUSTODIAL SIGNING - use test key only!)
+signing_key = "test_signing_key_placeholder"
 
 [worker]
-# Default worker identifier (will be overridden by controller)
-id = "worker-default"
+# Worker identifier (will be overridden by controller with worker-0, worker-1, etc.)
+id = "worker-cluster"
 
 # Metrics endpoint binding
 bind_metrics = "0.0.0.0:9100"
 
 [controller]
-# Worker hostnames or IP addresses
+# For SSH orchestration mode (use scripts/run_cluster_ssh.sh)
 worker_hosts = [
-    "node-bot-1",
-    "node-bot-2",
-    "node-bot-3",
-    "node-bot-4",
+    "bot-server-1",
+    "bot-server-2",
+    "bot-server-3"
 ]
+
+# For local testing mode (spawn N local worker processes)
+# local_workers = 4

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 /// Statistics tracker with integer-based latency histogram
+#[derive(Clone)]
 pub struct StatsCollector {
     pub attempted: u64,
     pub sent: u64,
