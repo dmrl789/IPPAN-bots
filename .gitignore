@@ -1,0 +1,25 @@
+# Rust
+target/
+Cargo.lock
+
+# Logs and results
+*.log
+*.csv
+runs/
+results/
+
+# Secrets
+.env
+secrets/
+keys/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

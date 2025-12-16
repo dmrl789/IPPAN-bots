@@ -1,0 +1,18 @@
+# Quick test configuration
+[scenario]
+seed = 42
+payload_bytes = 128
+batch_max = 5
+
+[[ramp.steps]]
+tps = 100
+hold_ms = 2000
+
+[target]
+rpc_urls = ["http://127.0.0.1:8080"]
+timeout_ms = 5000
+max_in_flight = 100
+
+[worker]
+id = "test-worker"
+bind_metrics = "127.0.0.1:9100"
