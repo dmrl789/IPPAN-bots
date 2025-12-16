@@ -6,6 +6,7 @@ pub struct Config {
     pub scenario: ScenarioConfig,
     pub ramp: RampConfig,
     pub target: TargetConfig,
+    pub payment: PaymentConfig,
     pub worker: WorkerConfig,
     #[serde(default)]
     pub controller: Option<ControllerConfig>,
@@ -25,10 +26,9 @@ pub struct ScenarioConfig {
     pub seed: u64,
     /// Optional global duration cap in milliseconds
     pub duration_ms: Option<u64>,
-    /// Fixed size for generated payloads in bytes
-    pub payload_bytes: u32,
-    /// Maximum transactions per batch (0 or 1 means no batching)
-    pub batch_max: u32,
+    /// Memo string to include in transactions (will be truncated to 256 bytes)
+    #[serde(default)]
+    pub memo: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,9 +63,27 @@ pub struct WorkerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentConfig {
+    /// Source address for payments
+    pub from: String,
+    /// Destination mode: "round_robin" or "single"
+    pub to_mode: String,
+    /// Path to file with list of destination addresses (for round_robin mode)
+    pub to_list_path: Option<String>,
+    /// Single destination address (for single mode)
+    pub to_single: Option<String>,
+    /// Payment amount (u128 as string to preserve precision)
+    pub amount: String,
+    /// Signing key (test key only!)
+    pub signing_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerConfig {
-    /// List of worker hostnames or addresses
-    pub worker_hosts: Vec<String>,
+    /// List of worker hostnames or addresses (for SSH orchestration)
+    pub worker_hosts: Option<Vec<String>>,
+    /// Number of local workers to spawn (for local testing)
+    pub local_workers: Option<u32>,
 }
 
 #[cfg(test)]
@@ -77,8 +95,7 @@ mod tests {
         let config_str = r#"
 [scenario]
 seed = 42
-payload_bytes = 512
-batch_max = 10
+memo = "test"
 
 [[ramp.steps]]
 tps = 1000
@@ -89,6 +106,13 @@ rpc_urls = ["http://localhost:8080"]
 timeout_ms = 5000
 max_in_flight = 1000
 
+[payment]
+from = "test_from_addr"
+to_mode = "single"
+to_single = "test_to_addr"
+amount = "1000"
+signing_key = "test_key"
+
 [worker]
 id = "test-worker"
 bind_metrics = "127.0.0.1:9100"
@@ -96,9 +120,11 @@ bind_metrics = "127.0.0.1:9100"
 
         let config: Config = toml::from_str(config_str).unwrap();
         assert_eq!(config.scenario.seed, 42);
-        assert_eq!(config.scenario.payload_bytes, 512);
+        assert_eq!(config.scenario.memo, "test");
         assert_eq!(config.ramp.steps.len(), 1);
         assert_eq!(config.ramp.steps[0].tps, 1000);
         assert_eq!(config.worker.id, "test-worker");
+        assert_eq!(config.payment.from, "test_from_addr");
+        assert_eq!(config.payment.amount, "1000");
     }
 }

@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use bots_core::{
-    Config, HttpJsonSubmitter, MockSubmitter, RampPlanner, RateLimiter, StatsCollector, TxSubmitter,
+    Config, HttpJsonSubmitter, MockSubmitter, PaymentTx, RampPlanner, RateLimiter, StatsCollector,
+    SubmitResult, TxSubmitter,
 };
 use clap::Parser;
-use rand::{RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -75,10 +75,9 @@ async fn main() -> Result<()> {
         config.worker.id, args.mode
     );
     info!("Seed: {}", config.scenario.seed);
-    info!(
-        "Payload size: {} bytes, Batch max: {}",
-        config.scenario.payload_bytes, config.scenario.batch_max
-    );
+    info!("Payment from: {}", config.payment.from);
+    info!("Payment to_mode: {}", config.payment.to_mode);
+    info!("Payment amount: {}", config.payment.amount);
 
     // Create submitter based on mode
     let submitter: Arc<dyn TxSubmitter> = match args.mode.as_str() {
@@ -92,8 +91,13 @@ async fn main() -> Result<()> {
 
     info!("Using submitter: {}", submitter.name());
 
+    // Load destination addresses
+    let to_addresses = load_to_addresses(&config)?;
+    info!("Loaded {} destination addresses", to_addresses.len());
+
     // Run the load test
-    let result = run_load_test(config.clone(), submitter, args.print_every_ms).await?;
+    let result =
+        run_load_test(config.clone(), submitter, to_addresses, args.print_every_ms).await?;
 
     // Write results to file
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
@@ -109,9 +113,45 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn load_to_addresses(config: &Config) -> Result<Vec<String>> {
+    match config.payment.to_mode.as_str() {
+        "single" => {
+            let to_addr = config
+                .payment
+                .to_single
+                .as_ref()
+                .context("to_single required for single mode")?;
+            Ok(vec![to_addr.clone()])
+        }
+        "round_robin" => {
+            let path = config
+                .payment
+                .to_list_path
+                .as_ref()
+                .context("to_list_path required for round_robin mode")?;
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read to_list_path: {}", path))?;
+            let addresses: Vec<String> = contents
+                .lines()
+                .map(|s: &str| s.trim().to_string())
+                .filter(|s: &String| !s.is_empty())
+                .collect();
+            if addresses.is_empty() {
+                anyhow::bail!("to_list_path file is empty: {}", path);
+            }
+            Ok(addresses)
+        }
+        other => anyhow::bail!(
+            "Invalid to_mode: {}, must be 'single' or 'round_robin'",
+            other
+        ),
+    }
+}
+
 async fn run_load_test(
     config: Config,
     submitter: Arc<dyn TxSubmitter>,
+    to_addresses: Vec<String>,
     print_every_ms: u64,
 ) -> Result<WorkerResult> {
     let start_time = Instant::now();
@@ -130,20 +170,36 @@ async fn run_load_test(
     // Create semaphore for max in-flight control
     let semaphore = Arc::new(Semaphore::new(config.target.max_in_flight as usize));
 
-    // Create RNG for payload generation
-    let mut rng = rand::rngs::StdRng::seed_from_u64(config.scenario.seed);
-
-    // Determine batch size
-    let batch_size = if config.scenario.batch_max > 1 {
-        config.scenario.batch_max as usize
-    } else {
-        1
-    };
-
-    info!("Batch size: {}", batch_size);
+    // Create channel for collecting results
+    let (result_tx, mut result_rx) = mpsc::channel::<SubmitResult>(10000);
 
     // Track last print time
     let mut last_print = Instant::now();
+
+    // Spawn stats collector task
+    let stats_handle = {
+        let mut stats_clone = stats.clone();
+        tokio::spawn(async move {
+            while let Some(result) = result_rx.recv().await {
+                stats_clone.record_sent(1);
+                stats_clone.record_success(
+                    result.accepted,
+                    result.rejected,
+                    result.timeouts,
+                    result.latency_ms,
+                );
+            }
+            stats_clone
+        })
+    };
+
+    // Truncate memo to 256 bytes
+    let memo = if config.scenario.memo.len() > 256 {
+        config.scenario.memo[..256].to_string()
+    } else {
+        config.scenario.memo.clone()
+    };
+    let memo = if memo.is_empty() { None } else { Some(memo) };
 
     // Execute ramp plan
     for window in windows {
@@ -155,6 +211,7 @@ async fn run_load_test(
         );
 
         let mut rate_limiter = RateLimiter::new(window.tps);
+        let mut to_idx = 0;
 
         // Generate transactions for this window
         while Instant::now() < window.end {
@@ -165,52 +222,61 @@ async fn run_load_test(
             }
 
             // Wait for rate limiter
-            if batch_size > 1 {
-                rate_limiter.acquire_batch(batch_size as u64).await;
-            } else {
-                rate_limiter.acquire().await;
-            }
+            rate_limiter.acquire().await;
 
-            // Generate batch of transactions
-            let mut batch = Vec::new();
-            for _ in 0..batch_size {
-                let tx = generate_transaction(&mut rng, config.scenario.payload_bytes);
-                batch.push(tx);
-            }
+            // Select destination address (round-robin)
+            let to_addr = to_addresses[to_idx % to_addresses.len()].clone();
+            to_idx += 1;
 
-            stats.record_attempted(batch.len() as u64);
+            // Create payment transaction
+            let tx = PaymentTx {
+                from: config.payment.from.clone(),
+                to: to_addr,
+                amount: config.payment.amount.clone(),
+                signing_key: config.payment.signing_key.clone(),
+                fee: None,
+                nonce: None,
+                memo: memo.clone(),
+            };
+
+            stats.record_attempted(1);
 
             // Acquire semaphore permit
             let permit = semaphore.clone().acquire_owned().await?;
             let submitter = submitter.clone();
-            let batch_len = batch.len() as u64;
+            let result_tx = result_tx.clone();
 
             // Submit in background
             tokio::spawn(async move {
-                match submitter.submit_batch(&batch).await {
+                match submitter.submit_payment(&tx).await {
                     Ok(result) => {
-                        // Stats will be collected by the main thread
-                        // For now, we just drop the result
-                        // In a real implementation, we'd send this back via a channel
-                        drop((result, permit));
+                        let _ = result_tx.send(result).await;
                     }
                     Err(e) => {
                         warn!("Submission error: {}", e);
-                        drop(permit);
+                        // Send error result
+                        let _ = result_tx
+                            .send(SubmitResult {
+                                accepted: 0,
+                                rejected: 0,
+                                timeouts: 0,
+                                latency_ms: 0,
+                            })
+                            .await;
                     }
                 }
+                drop(permit);
             });
-
-            // For stats tracking, we'll optimistically count as sent/accepted in mock mode
-            // In a real implementation, we'd use channels to collect actual results
-            stats.record_sent(batch_len);
-            stats.record_success(batch_len, 0, 0, 5); // Placeholder latency
         }
     }
 
     // Wait for in-flight requests to complete
     info!("Waiting for in-flight requests to complete...");
     let _ = semaphore.acquire_many(config.target.max_in_flight).await?;
+
+    // Close result channel and wait for stats collector
+    drop(result_tx);
+    stats = stats_handle.await?;
 
     let summary = stats.summary();
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
@@ -235,12 +301,6 @@ async fn run_load_test(
         latency_p99_ms: summary.latency_p99_ms,
         achieved_tps,
     })
-}
-
-fn generate_transaction(rng: &mut impl RngCore, size: u32) -> Vec<u8> {
-    let mut tx = vec![0u8; size as usize];
-    rng.fill_bytes(&mut tx);
-    tx
 }
 
 fn print_progress(stats: &StatsCollector) {

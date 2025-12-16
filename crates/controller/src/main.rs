@@ -3,7 +3,7 @@ use bots_core::{Config, RampPlanner};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "controller")]
@@ -20,6 +20,10 @@ struct Args {
     /// Dry run: print what would be executed without running
     #[arg(long)]
     dry_run: bool,
+
+    /// Number of local workers to spawn (overrides config)
+    #[arg(long)]
+    local: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,37 +85,68 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Check if controller config exists
-    let controller_config = config
-        .controller
-        .as_ref()
-        .context("Controller configuration is required")?;
+    // Determine mode: local or SSH
+    let local_workers = args
+        .local
+        .or_else(|| config.controller.as_ref().and_then(|c| c.local_workers));
 
-    info!(
-        "Controller will orchestrate {} workers",
-        controller_config.worker_hosts.len()
-    );
+    if let Some(n) = local_workers {
+        info!("Running {} local workers", n);
+        if args.dry_run {
+            println!("\n=== Dry Run (Local Mode) ===");
+            println!("Would spawn {} local worker processes", n);
+            return Ok(());
+        }
 
-    if args.dry_run {
-        print_dry_run(&config, controller_config);
-        return Ok(());
-    }
+        run_local_workers(&config, n).await?;
 
-    // Note: Full SSH orchestration would be implemented here
-    // For now, we provide a script-based approach (see scripts/run_cluster_ssh.sh)
-    info!("Note: Use scripts/run_cluster_ssh.sh for SSH-based orchestration");
-    info!("Controller binary can be extended to handle SSH orchestration directly");
-
-    // Simulate collecting results (in real implementation, would collect from workers)
-    let results = collect_worker_results(controller_config).await?;
-
-    if !results.is_empty() {
-        // Merge and save results
-        let merged = merge_results(results);
-        save_merged_results(&merged)?;
-        print_merged_summary(&merged);
+        // Collect and merge results
+        let results = collect_worker_results().await?;
+        if !results.is_empty() {
+            let merged = merge_results(results);
+            save_merged_results(&merged)?;
+            print_merged_summary(&merged);
+        } else {
+            info!("No worker results found.");
+        }
     } else {
-        info!("No worker results found. Run workers first.");
+        // SSH mode
+        let controller_config = config
+            .controller
+            .as_ref()
+            .context("Controller configuration is required")?;
+
+        let worker_hosts = controller_config
+            .worker_hosts
+            .as_ref()
+            .context("worker_hosts required for SSH mode")?;
+
+        info!(
+            "Controller will orchestrate {} workers via SSH",
+            worker_hosts.len()
+        );
+
+        if args.dry_run {
+            print_dry_run(&config, worker_hosts);
+            return Ok(());
+        }
+
+        // Note: Full SSH orchestration would be implemented here
+        // For now, we provide a script-based approach (see scripts/run_cluster_ssh.sh)
+        info!("Note: Use scripts/run_cluster_ssh.sh for SSH-based orchestration");
+        info!("Controller binary can be extended to handle SSH orchestration directly");
+
+        // Simulate collecting results (in real implementation, would collect from workers)
+        let results = collect_worker_results().await?;
+
+        if !results.is_empty() {
+            // Merge and save results
+            let merged = merge_results(results);
+            save_merged_results(&merged)?;
+            print_merged_summary(&merged);
+        } else {
+            info!("No worker results found. Run workers first.");
+        }
     }
 
     Ok(())
@@ -135,17 +170,16 @@ fn print_ramp_schedule(planner: &RampPlanner) {
     println!();
 }
 
-fn print_dry_run(config: &Config, controller_config: &bots_core::ControllerConfig) {
-    println!("\n=== Dry Run ===");
-    println!("Worker hosts: {:?}", controller_config.worker_hosts);
+fn print_dry_run(config: &Config, worker_hosts: &[String]) {
+    println!("\n=== Dry Run (SSH Mode) ===");
+    println!("Worker hosts: {:?}", worker_hosts);
     println!("RPC targets: {:?}", config.target.rpc_urls);
     println!("Max in-flight: {}", config.target.max_in_flight);
-    println!("Batch max: {}", config.scenario.batch_max);
-    println!("Payload bytes: {}", config.scenario.payload_bytes);
+    println!("Payment from: {}", config.payment.from);
     println!("Seed: {}", config.scenario.seed);
     println!("\nWould execute:");
 
-    for (idx, host) in controller_config.worker_hosts.iter().enumerate() {
+    for (idx, host) in worker_hosts.iter().enumerate() {
         println!(
             "  ssh {} 'cd /path/to/worker && ./worker --worker-id worker-{} --config config.toml --mode http'",
             host, idx
@@ -154,9 +188,64 @@ fn print_dry_run(config: &Config, controller_config: &bots_core::ControllerConfi
     println!();
 }
 
-async fn collect_worker_results(
-    _controller_config: &bots_core::ControllerConfig,
-) -> Result<Vec<WorkerResult>> {
+async fn run_local_workers(config: &Config, n: u32) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    info!("Spawning {} local workers...", n);
+
+    let mut handles = Vec::new();
+
+    // Write config to temp file
+    let config_path = "results/temp_config.toml";
+    std::fs::create_dir_all("results").ok();
+    let config_toml = toml::to_string_pretty(config)?;
+    std::fs::write(config_path, config_toml)?;
+
+    for i in 0..n {
+        let worker_id = format!("worker-{}", i);
+        info!("Starting {}", worker_id);
+
+        let mut cmd = Command::new("cargo");
+        cmd.args(["run", "--release", "--bin", "worker", "--"])
+            .arg("--config")
+            .arg(config_path)
+            .arg("--worker-id")
+            .arg(&worker_id)
+            .arg("--mode")
+            .arg("http")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let handle = tokio::spawn(async move {
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    if let Err(e) = child.wait().await {
+                        warn!("Worker {} failed: {}", worker_id, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to spawn worker {}: {}", worker_id, e);
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all workers to complete
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    // Clean up temp config
+    let _ = std::fs::remove_file(config_path);
+
+    info!("All workers completed");
+    Ok(())
+}
+
+async fn collect_worker_results() -> Result<Vec<WorkerResult>> {
     let mut results = Vec::new();
 
     // Look for worker result files in results/ directory

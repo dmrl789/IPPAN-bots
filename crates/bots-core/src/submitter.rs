@@ -12,13 +12,27 @@ pub struct SubmitResult {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentTx {
+    pub from: String,
+    pub to: String,
+    pub amount: String,
+    pub signing_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
 /// Trait for transaction submission adapters
 pub trait TxSubmitter: Send + Sync {
     fn name(&self) -> &'static str;
 
-    fn submit_batch<'a>(
+    fn submit_payment<'a>(
         &'a self,
-        batch: &'a [Vec<u8>],
+        tx: &'a PaymentTx,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<SubmitResult>> + Send + 'a>>;
 }
 
@@ -38,15 +52,15 @@ impl TxSubmitter for MockSubmitter {
         "mock"
     }
 
-    fn submit_batch<'a>(
+    fn submit_payment<'a>(
         &'a self,
-        batch: &'a [Vec<u8>],
+        _tx: &'a PaymentTx,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<SubmitResult>> + Send + 'a>> {
         Box::pin(async move {
             sleep(Duration::from_millis(self.delay_ms)).await;
 
             Ok(SubmitResult {
-                accepted: batch.len() as u64,
+                accepted: 1,
                 rejected: 0,
                 timeouts: 0,
                 latency_ms: self.delay_ms,
@@ -90,48 +104,67 @@ impl TxSubmitter for HttpJsonSubmitter {
         "http"
     }
 
-    fn submit_batch<'a>(
+    fn submit_payment<'a>(
         &'a self,
-        batch: &'a [Vec<u8>],
+        tx: &'a PaymentTx,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<SubmitResult>> + Send + 'a>> {
         Box::pin(async move {
             let start = std::time::Instant::now();
             let url = self.next_url();
 
-            // TODO: Align with IPPAN RPC specification
-            // This is a stubbed implementation with placeholder request format
-            let request_body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "submit_transaction_batch",
-                "params": {
-                    "transactions": batch.iter()
-                        .map(|tx| hex::encode(tx))
-                        .collect::<Vec<_>>()
-                }
-            });
+            // POST to /tx/payment endpoint with single transaction
+            let endpoint = format!("{}/tx/payment", url);
 
-            // TODO: Replace with actual IPPAN endpoint path
-            let endpoint = format!("{}/rpc", url);
-
-            match self.client.post(&endpoint).json(&request_body).send().await {
+            match self.client.post(&endpoint).json(&tx).send().await {
                 Ok(response) => {
                     let latency_ms = start.elapsed().as_millis() as u64;
 
                     if response.status().is_success() {
-                        // TODO: Parse actual IPPAN response format
-                        // For now, assume all accepted
-                        Ok(SubmitResult {
-                            accepted: batch.len() as u64,
-                            rejected: 0,
-                            timeouts: 0,
-                            latency_ms,
-                        })
+                        // Try to parse response
+                        match response.json::<serde_json::Value>().await {
+                            Ok(body) => {
+                                // Success if response has tx_hash field or is 2xx
+                                if body.get("tx_hash").is_some() {
+                                    Ok(SubmitResult {
+                                        accepted: 1,
+                                        rejected: 0,
+                                        timeouts: 0,
+                                        latency_ms,
+                                    })
+                                } else if body.get("code").is_some() || body.get("error").is_some()
+                                {
+                                    // Error response
+                                    Ok(SubmitResult {
+                                        accepted: 0,
+                                        rejected: 1,
+                                        timeouts: 0,
+                                        latency_ms,
+                                    })
+                                } else {
+                                    // Assume success if 2xx
+                                    Ok(SubmitResult {
+                                        accepted: 1,
+                                        rejected: 0,
+                                        timeouts: 0,
+                                        latency_ms,
+                                    })
+                                }
+                            }
+                            Err(_) => {
+                                // If can't parse JSON, assume success on 2xx
+                                Ok(SubmitResult {
+                                    accepted: 1,
+                                    rejected: 0,
+                                    timeouts: 0,
+                                    latency_ms,
+                                })
+                            }
+                        }
                     } else {
-                        // TODO: Parse error response for rejected count
+                        // Non-2xx status = rejected
                         Ok(SubmitResult {
                             accepted: 0,
-                            rejected: batch.len() as u64,
+                            rejected: 1,
                             timeouts: 0,
                             latency_ms,
                         })
@@ -140,20 +173,11 @@ impl TxSubmitter for HttpJsonSubmitter {
                 Err(e) if e.is_timeout() => Ok(SubmitResult {
                     accepted: 0,
                     rejected: 0,
-                    timeouts: batch.len() as u64,
+                    timeouts: 1,
                     latency_ms: self.timeout.as_millis() as u64,
                 }),
                 Err(e) => Err(e.into()),
             }
         })
-    }
-}
-
-// Add hex encoding support for HttpJsonSubmitter
-mod hex {
-    pub fn encode(data: &[u8]) -> String {
-        data.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
     }
 }
