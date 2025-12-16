@@ -2,27 +2,59 @@
 set -euo pipefail
 
 # SSH-based cluster orchestration script
-# Usage: ./scripts/run_cluster_ssh.sh <config.toml>
+# Usage:
+#   ./scripts/run_cluster_ssh.sh <config.toml> <host1> <host2> <host3> <host4>
+# Example:
+#   ./scripts/run_cluster_ssh.sh config/example.deventer.toml \
+#     bot1@188.245.97.41 bot2@135.181.145.174 bot3@5.223.51.238 bot4@178.156.219.107
 
-CONFIG=${1:-config/example.cluster.toml}
+CONFIG=${1:-}
+shift || true
 RUN_ID=${RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")}
 REMOTE_DIR=${REMOTE_DIR:-/opt/ippan-bots}
-COLLECT_AFTER_SEC=${COLLECT_AFTER_SEC:-0}
+WAIT_FOR_RESULTS=${WAIT_FOR_RESULTS:-1}
+MAX_WAIT_SEC=${MAX_WAIT_SEC:-7200}
+POLL_SEC=${POLL_SEC:-2}
+
+if [ -z "${CONFIG}" ]; then
+  echo "Usage: $0 <config.toml> <host1> <host2> <host3> <host4>"
+  exit 1
+fi
 
 if [ ! -f "$CONFIG" ]; then
-    echo "Error: Config file not found: $CONFIG"
-    exit 1
+  echo "Error: Config file not found: $CONFIG"
+  exit 1
 fi
 
-echo "=== Building release binary ==="
-cargo build --release --bin worker
+WORKER_HOSTS=("$@")
+if [ "${#WORKER_HOSTS[@]}" -eq 0 ]; then
+  echo "Error: No worker hosts provided."
+  echo "Usage: $0 <config.toml> <host1> <host2> <host3> <host4>"
+  exit 1
+fi
+
+LOCAL_OUT="results/deventer/${RUN_ID}"
+mkdir -p "${LOCAL_OUT}"
+
+stop_workers() {
+  echo ""
+  echo "=== Stopping workers (run_id=${RUN_ID}) ==="
+  for host in "${WORKER_HOSTS[@]}"; do
+    # Best-effort stop by PID file; ignore errors.
+    ssh "$host" "set -e; cd $REMOTE_DIR || exit 0; \
+      for f in results/*.pid; do \
+        [ -f \"\$f\" ] || continue; \
+        pid=\$(cat \"\$f\" 2>/dev/null || true); \
+        if [ -n \"\$pid\" ]; then kill \"\$pid\" 2>/dev/null || true; fi; \
+      done" >/dev/null 2>&1 || true
+  done
+}
+trap stop_workers INT TERM
+
+echo "=== Building release binaries locally ==="
+cargo build --release --bin worker --bin controller
 
 BINARY="target/release/worker"
-if [ -n "${WORKER_HOSTS:-}" ]; then
-  IFS=',' read -r -a WORKER_HOSTS <<< "${WORKER_HOSTS}"
-else
-  WORKER_HOSTS=("bot-server-1" "bot-server-2" "bot-server-3" "bot-server-4")  # set WORKER_HOSTS=host1,host2,host3,host4
-fi
 
 echo ""
 echo "=== Deploying to worker hosts ==="
@@ -38,37 +70,95 @@ done
 
 echo ""
 echo "=== Starting workers ==="
-PIDS=()
-for i in "${!WORKER_HOSTS[@]}"; do
-    host="${WORKER_HOSTS[$i]}"
-    worker_id="worker-$i"
-    echo "Starting $worker_id on $host..."
-    
-    ssh "$host" "cd $REMOTE_DIR && nohup ./worker \
-        --config config/config.toml \
-        --mode http \
-        --worker-id $worker_id \
-        --run-id $RUN_ID \
-        > results/${worker_id}.log 2>&1 &"
+for host in "${WORKER_HOSTS[@]}"; do
+  # Prefer the SSH username as the worker-id (bot1@..., bot2@..., ...).
+  worker_id="${host%@*}"
+  if [ -z "${worker_id}" ] || [ "${worker_id}" = "${host}" ]; then
+    # Fallback: sanitize host string.
+    worker_id="$(echo "${host}" | tr '.:@/' '____')"
+  fi
+
+  echo "Starting ${worker_id} on ${host}..."
+  ssh "$host" "set -e; cd $REMOTE_DIR; \
+    nohup ./worker \
+      --config config/config.toml \
+      --mode http \
+      --worker-id ${worker_id} \
+      --run-id ${RUN_ID} \
+      --print-every-ms 1000 \
+      > results/worker_${worker_id}_${RUN_ID}.log 2>&1 & \
+    echo \$! > results/worker_${worker_id}_${RUN_ID}.pid"
 done
 
 echo ""
 echo "=== Workers started ==="
-echo "Monitor logs on each host: $REMOTE_DIR/results/worker-*.log"
+echo "run_id: ${RUN_ID}"
+echo "Remote logs: ${REMOTE_DIR}/results/worker_*_${RUN_ID}.log"
+echo "Local output dir: ${LOCAL_OUT}"
 
-if [ "$COLLECT_AFTER_SEC" -gt 0 ]; then
+echo ""
+echo "=== Tail logs (brief) ==="
+for host in "${WORKER_HOSTS[@]}"; do
+  worker_id="${host%@*}"
+  if [ -z "${worker_id}" ] || [ "${worker_id}" = "${host}" ]; then
+    worker_id="$(echo "${host}" | tr '.:@/' '____')"
+  fi
+  echo "--- ${host} (${worker_id}) ---"
+  ssh "$host" "tail -n 20 $REMOTE_DIR/results/worker_${worker_id}_${RUN_ID}.log 2>/dev/null || true" || true
+done
+
+if [ "${WAIT_FOR_RESULTS}" -eq 1 ]; then
   echo ""
-  echo "=== Waiting ${COLLECT_AFTER_SEC}s before collecting results ==="
-  sleep "$COLLECT_AFTER_SEC"
+  echo "=== Waiting for results (max ${MAX_WAIT_SEC}s, poll ${POLL_SEC}s) ==="
+  start_epoch="$(date -u +%s)"
+  while true; do
+    done_count=0
+    for host in "${WORKER_HOSTS[@]}"; do
+      worker_id="${host%@*}"
+      if [ -z "${worker_id}" ] || [ "${worker_id}" = "${host}" ]; then
+        worker_id="$(echo "${host}" | tr '.:@/' '____')"
+      fi
+      if ssh "$host" "test -f $REMOTE_DIR/results/worker_${worker_id}_${RUN_ID}.json"; then
+        done_count=$((done_count + 1))
+      fi
+    done
+    if [ "${done_count}" -eq "${#WORKER_HOSTS[@]}" ]; then
+      break
+    fi
+    now_epoch="$(date -u +%s)"
+    elapsed=$((now_epoch - start_epoch))
+    if [ "${elapsed}" -ge "${MAX_WAIT_SEC}" ]; then
+      echo "Timed out waiting for results after ${elapsed}s."
+      break
+    fi
+    sleep "${POLL_SEC}"
+  done
 fi
 
 echo ""
-echo "=== Collecting any worker results into ./results ==="
-mkdir -p results
+echo "=== Collecting worker results into ${LOCAL_OUT} ==="
+mkdir -p results "${LOCAL_OUT}"
 for host in "${WORKER_HOSTS[@]}"; do
-  scp "$host:$REMOTE_DIR/results/worker_*_${RUN_ID}.json" "results/" 2>/dev/null || true
+  worker_id="${host%@*}"
+  if [ -z "${worker_id}" ] || [ "${worker_id}" = "${host}" ]; then
+    worker_id="$(echo "${host}" | tr '.:@/' '____')"
+  fi
+  scp "$host:$REMOTE_DIR/results/worker_${worker_id}_${RUN_ID}.json" "${LOCAL_OUT}/" 2>/dev/null || true
 done
 
 echo ""
-echo "=== If all workers have finished, merge with controller ==="
-echo "cargo run --release --bin controller -- --config $CONFIG --merge-run-id $RUN_ID"
+echo "=== Merging results locally (controller) ==="
+# Controller currently reads from ./results, so stage a copy there for merging.
+cp -f "${LOCAL_OUT}"/worker_*_"${RUN_ID}".json results/ 2>/dev/null || true
+
+if ls "results/worker_*_${RUN_ID}.json" >/dev/null 2>&1; then
+  cargo run --release --bin controller -- --config "$CONFIG" --merge-run-id "$RUN_ID"
+  if [ -f "results/run_${RUN_ID}_merged.json" ]; then
+    cp -f "results/run_${RUN_ID}_merged.json" "${LOCAL_OUT}/"
+    echo "Merged: ${LOCAL_OUT}/run_${RUN_ID}_merged.json"
+  fi
+else
+  echo "No worker result JSONs staged in ./results for run_id=${RUN_ID}; merge skipped."
+  echo "Re-run collection after workers finish, then run:"
+  echo "  cargo run --release --bin controller -- --config $CONFIG --merge-run-id $RUN_ID"
+fi

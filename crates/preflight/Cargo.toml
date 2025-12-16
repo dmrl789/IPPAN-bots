@@ -1,0 +1,20 @@
+[package]
+name = "preflight"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "preflight"
+path = "src/main.rs"
+
+[dependencies]
+bots-core = { path = "../bots-core" }
+tokio = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+

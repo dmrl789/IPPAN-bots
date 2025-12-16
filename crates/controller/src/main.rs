@@ -24,6 +24,12 @@ struct Args {
     #[arg(long = "local-workers", alias = "local", default_value_t = 0)]
     local_workers: u32,
 
+    /// Print a per-worker TPS plan for N workers (useful for SSH-based runs)
+    ///
+    /// If `--local-workers` is set, that value is used instead.
+    #[arg(long = "plan-workers", default_value_t = 0)]
+    plan_workers: u32,
+
     /// Only print the ramp schedule without running
     #[arg(long)]
     ramp_only: bool,
@@ -44,6 +50,10 @@ struct WorkerResult {
     sent: u64,
     accepted: u64,
     rejected: u64,
+    #[serde(default)]
+    backpressure_429: u64,
+    #[serde(default)]
+    backpressure_503: u64,
     errors: u64,
     timeouts: u64,
     latency_p50_ms: u64,
@@ -62,6 +72,8 @@ struct MergedResult {
     total_sent: u64,
     total_accepted: u64,
     total_rejected: u64,
+    total_backpressure_429: u64,
+    total_backpressure_503: u64,
     total_errors: u64,
     total_timeouts: u64,
     avg_latency_p50_ms: u64,
@@ -86,6 +98,15 @@ async fn main() -> Result<()> {
 
     let planner = RampPlanner::new(config.ramp.clone());
     print_ramp_schedule(&planner);
+
+    let plan_workers = if args.local_workers > 0 {
+        args.local_workers
+    } else {
+        args.plan_workers
+    };
+    if plan_workers > 0 {
+        print_per_worker_tps_plan(&planner, plan_workers);
+    }
 
     if args.ramp_only {
         return Ok(());
@@ -188,6 +209,27 @@ fn print_ramp_schedule(planner: &RampPlanner) {
 
     for (idx, step) in planner.steps().iter().enumerate() {
         println!("Step {}: {} TPS for {}ms", idx, step.tps, step.hold_ms);
+    }
+    println!();
+}
+
+fn print_per_worker_tps_plan(planner: &RampPlanner, workers: u32) {
+    println!("\n=== Per-Worker TPS Plan ===");
+    println!("Workers: {}", workers);
+    println!();
+
+    for (idx, step) in planner.steps().iter().enumerate() {
+        let total = step.tps;
+        let base = if workers == 0 { 0 } else { total / workers as u64 };
+        let rem = if workers == 0 { 0 } else { total % workers as u64 };
+        println!("Step {}: total_tps={} (base={} rem={})", idx, total, base, rem);
+
+        // Integer division + remainder distribution: first `rem` workers get +1.
+        let mut parts = Vec::with_capacity(workers as usize);
+        for w in 0..workers {
+            parts.push(split_tps(total, workers, w));
+        }
+        println!("  per_worker_tps={:?}", parts);
     }
     println!();
 }
@@ -309,6 +351,8 @@ fn merge_results(run_id: String, workers: Vec<WorkerResult>) -> MergedResult {
     let total_sent = workers.iter().map(|w| w.sent).sum();
     let total_accepted = workers.iter().map(|w| w.accepted).sum();
     let total_rejected = workers.iter().map(|w| w.rejected).sum();
+    let total_backpressure_429 = workers.iter().map(|w| w.backpressure_429).sum();
+    let total_backpressure_503 = workers.iter().map(|w| w.backpressure_503).sum();
     let total_errors = workers.iter().map(|w| w.errors).sum();
     let total_timeouts = workers.iter().map(|w| w.timeouts).sum();
 
@@ -342,6 +386,8 @@ fn merge_results(run_id: String, workers: Vec<WorkerResult>) -> MergedResult {
         total_sent,
         total_accepted,
         total_rejected,
+        total_backpressure_429,
+        total_backpressure_503,
         total_errors,
         total_timeouts,
         avg_latency_p50_ms,
@@ -379,6 +425,8 @@ fn print_merged_summary(merged: &MergedResult) {
     println!("Total sent: {}", merged.total_sent);
     println!("Total accepted: {}", merged.total_accepted);
     println!("Total rejected: {}", merged.total_rejected);
+    println!("Total backpressure 429: {}", merged.total_backpressure_429);
+    println!("Total backpressure 503: {}", merged.total_backpressure_503);
     println!("Total errors: {}", merged.total_errors);
     println!("Total timeouts: {}", merged.total_timeouts);
     println!("Total achieved TPS: {}", merged.total_achieved_tps);
