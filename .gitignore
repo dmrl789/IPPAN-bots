@@ -1,0 +1,27 @@
+# Rust
+/target/
+
+# Outputs
+*.log
+*.csv
+
+# Local env
+.env
+
+# Secrets / keys (never commit)
+secrets/
+keys/
+
+# Runs / results
+runs/
+runs/**
+!runs/.gitkeep
+
+results/
+results/**
+!results/.gitkeep
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
