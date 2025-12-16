@@ -1,0 +1,17 @@
+[package]
+name = "prefund"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "prefund"
+path = "src/main.rs"
+
+[dependencies]
+bots-core = { path = "../bots-core" }
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+

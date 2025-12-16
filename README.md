@@ -20,6 +20,14 @@ This system consists of:
 
 ## Important Notes
 
+### Always run preflight before load tests
+
+Before any real run (especially distributed), run the preflight checks against your configured `rpc_urls`:
+
+```bash
+cargo run --bin preflight -- --config config/example.deventer.toml
+```
+
 ### Port Usage
 
 - **Port 8080**: IPPAN HTTP API endpoint (used by bots for `/tx/payment`)
@@ -96,16 +104,40 @@ cargo run --release --bin controller -- \
 ### Multi-Worker Cluster via SSH
 
 ```bash
-# Edit config/example.cluster.toml to set worker_hosts
-# Ensure SSH access and proper paths
-
-./scripts/run_cluster_ssh.sh config/example.cluster.toml
+# Deventer-style run: pass config + 4 worker hosts
+./scripts/run_cluster_ssh.sh config/example.deventer.toml \
+  bot1@188.245.97.41 bot2@135.181.145.174 bot3@5.223.51.238 bot4@178.156.219.107
 ```
 
 The script will:
 - Build and deploy worker binary to each host
 - Start workers with synchronized ramp schedules
-- Collect and merge results into `results/run_<timestamp>_merged.json`
+- Collect results into `results/deventer/<run_id>/` and merge into `results/run_<run_id>_merged.json`
+
+### Prefund estimator (fees enabled)
+
+```bash
+cargo run --bin prefund -- --config config/example.deventer.toml
+```
+
+This prints a deterministic prefund estimate and writes `results/prefund_<timestamp>.json`.
+
+## Deventer 4-bot run checklist
+
+1. DNS/TLS sanity:
+   - `api1..api4.ippan.uk` resolve to the expected IPs
+2. Proxy config:
+   - `/tx/payment` → `127.0.0.1:8080`
+3. Preflight:
+   - `cargo run --bin preflight -- --config config/example.deventer.toml`
+4. Prefund:
+   - `cargo run --bin prefund -- --config config/example.deventer.toml`
+5. Plan fairness (optional but recommended):
+   - `cargo run --bin controller -- --config config/example.deventer.toml --ramp-only --plan-workers 4`
+6. Run:
+   - `./scripts/run_cluster_ssh.sh config/example.deventer.toml bot1@... bot2@... bot3@... bot4@...`
+7. Collect + inspect results:
+   - `results/deventer/<run_id>/`
 
 ## Configuration
 
@@ -175,6 +207,8 @@ Worker results are written as JSON:
   "sent": 599800,
   "accepted": 599500,
   "rejected": 200,
+  "backpressure_429": 50,
+  "backpressure_503": 10,
   "errors": 100,
   "timeouts": 0,
   "latency_p50_ms": 45,
@@ -221,6 +255,8 @@ GitHub Actions runs:
 │   ├── bots-core/       # Shared types, rate limiter, ramp planner, stats
 │   ├── worker/          # Load generator binary
 │   ├── controller/      # Orchestration binary
+│   ├── preflight/       # DNS/TLS/API health checks for rpc_urls
+│   ├── prefund/         # Prefund estimator (fees enabled)
 │   └── keygen/          # Key generation utility (optional)
 ├── config/              # Example TOML configurations
 ├── scripts/             # Helper scripts for running tests

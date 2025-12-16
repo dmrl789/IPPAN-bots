@@ -47,6 +47,8 @@ struct WorkerResult {
     sent: u64,
     accepted: u64,
     rejected: u64,
+    backpressure_429: u64,
+    backpressure_503: u64,
     errors: u64,
     timeouts: u64,
     latency_p50_ms: u64,
@@ -146,11 +148,13 @@ async fn run_load_test(
             let elapsed_ms = s.duration_ms.max(1);
             let tps = (s.accepted.saturating_mul(1000)) / elapsed_ms;
             info!(
-                "progress attempted={} sent={} ok={} rej={} err={} to={} tps={} p50={}ms p95={}ms p99={}ms",
+                "progress attempted={} sent={} ok={} rej={} bp429={} bp503={} err={} to={} tps={} p50={}ms p95={}ms p99={}ms",
                 s.attempted,
                 s.sent,
                 s.accepted,
                 s.rejected,
+                s.backpressure_429,
+                s.backpressure_503,
                 s.errors,
                 s.timeouts,
                 tps,
@@ -209,6 +213,8 @@ async fn run_load_test(
         sent: summary.sent,
         accepted: summary.accepted,
         rejected: summary.rejected,
+        backpressure_429: summary.backpressure_429,
+        backpressure_503: summary.backpressure_503,
         errors: summary.errors,
         timeouts: summary.timeouts,
         latency_p50_ms: summary.latency_p50_ms,
@@ -232,6 +238,8 @@ struct PaymentBody {
 struct SubmitOutcome {
     kind: OutcomeKind,
     latency_ms: u64,
+    backpressure_429: u64,
+    backpressure_503: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -271,6 +279,8 @@ impl PaymentSubmitter for MockPaymentSubmitter {
             Ok(SubmitOutcome {
                 kind: OutcomeKind::Accepted,
                 latency_ms: self.delay_ms,
+                backpressure_429: 0,
+                backpressure_503: 0,
             })
         })
     }
@@ -306,45 +316,100 @@ impl PaymentSubmitter for HttpPaymentSubmitter {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>>
     {
         Box::pin(async move {
-            let start = std::time::Instant::now();
+            // Retry policy (bounded; per-tx):
+            // - Network errors/timeouts: retry up to 2 times (10ms then 30ms backoff)
+            // - HTTP 429/503: count as backpressure signals and retry once (10ms backoff)
+            // - HTTP 4xx (except 429): do not retry
+            let start_all = std::time::Instant::now();
             let endpoint = Self::endpoint(base_url);
 
-            let resp = self.client.post(endpoint).json(body).send().await;
-            match resp {
-                Ok(r) => {
-                    let latency_ms = start.elapsed().as_millis() as u64;
-                    let status = r.status();
+            let mut backpressure_429 = 0u64;
+            let mut backpressure_503 = 0u64;
 
-                    // Spec:
-                    // - Success: HTTP 200 + `tx_hash`
-                    // - Error: non-2xx OR `{code,message}`
-                    let parsed: Option<serde_json::Value> = r.json().await.ok();
+            let mut network_retry_used = 0u8; // 0..=2
+            let mut backpressure_retry_used = 0u8; // 0..=1
 
-                    let has_tx_hash = parsed
-                        .as_ref()
-                        .and_then(|v| v.get("tx_hash"))
-                        .and_then(|v| v.as_str())
-                        .is_some();
-                    let looks_like_error = parsed.as_ref().and_then(|v| v.get("code")).is_some()
-                        && parsed.as_ref().and_then(|v| v.get("message")).is_some();
+            loop {
+                let resp = self.client.post(&endpoint).json(body).send().await;
+                match resp {
+                    Ok(r) => {
+                        let status = r.status();
+                        let status_u16 = status.as_u16();
 
-                    if status.as_u16() == 200 && has_tx_hash && !looks_like_error {
-                        Ok(SubmitOutcome {
-                            kind: OutcomeKind::Accepted,
-                            latency_ms,
-                        })
-                    } else {
-                        Ok(SubmitOutcome {
-                            kind: OutcomeKind::Rejected,
-                            latency_ms,
-                        })
+                        if status_u16 == 429 {
+                            backpressure_429 = backpressure_429.saturating_add(1);
+                            if backpressure_retry_used < 1 {
+                                backpressure_retry_used = backpressure_retry_used.saturating_add(1);
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                continue;
+                            }
+                        } else if status_u16 == 503 {
+                            backpressure_503 = backpressure_503.saturating_add(1);
+                            if backpressure_retry_used < 1 {
+                                backpressure_retry_used = backpressure_retry_used.saturating_add(1);
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                continue;
+                            }
+                        } else if status.is_client_error() {
+                            // 4xx (except 429 handled above): no retry
+                        }
+
+                        // Spec:
+                        // - Success: HTTP 200 + `tx_hash`
+                        // - Error: non-2xx OR `{code,message}`
+                        let parsed: Option<serde_json::Value> = r.json().await.ok();
+
+                        let has_tx_hash = parsed
+                            .as_ref()
+                            .and_then(|v| v.get("tx_hash"))
+                            .and_then(|v| v.as_str())
+                            .is_some();
+                        let looks_like_error =
+                            parsed.as_ref().and_then(|v| v.get("code")).is_some()
+                                && parsed.as_ref().and_then(|v| v.get("message")).is_some();
+
+                        let latency_ms = start_all.elapsed().as_millis() as u64;
+                        if status_u16 == 200 && has_tx_hash && !looks_like_error {
+                            return Ok(SubmitOutcome {
+                                kind: OutcomeKind::Accepted,
+                                latency_ms,
+                                backpressure_429,
+                                backpressure_503,
+                            });
+                        } else {
+                            return Ok(SubmitOutcome {
+                                kind: OutcomeKind::Rejected,
+                                latency_ms,
+                                backpressure_429,
+                                backpressure_503,
+                            });
+                        }
                     }
+                    Err(e) if e.is_timeout() => {
+                        if network_retry_used < 2 {
+                            let backoff_ms = if network_retry_used == 0 { 10 } else { 30 };
+                            network_retry_used = network_retry_used.saturating_add(1);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        }
+                        return Ok(SubmitOutcome {
+                            kind: OutcomeKind::Timeout,
+                            latency_ms: self.timeout_ms,
+                            backpressure_429,
+                            backpressure_503,
+                        });
+                    }
+                    Err(e) if e.is_connect() => {
+                        if network_retry_used < 2 {
+                            let backoff_ms = if network_retry_used == 0 { 10 } else { 30 };
+                            network_retry_used = network_retry_used.saturating_add(1);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        }
+                        return Err(e.into());
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) if e.is_timeout() => Ok(SubmitOutcome {
-                    kind: OutcomeKind::Timeout,
-                    latency_ms: self.timeout_ms,
-                }),
-                Err(e) => Err(e.into()),
             }
         })
     }
@@ -491,11 +556,17 @@ async fn launch_window(
             tokio::spawn(async move {
                 let _permit: OwnedSemaphorePermit = permit;
                 match submitter.submit_payment(&base_url, &body).await {
-                    Ok(outcome) => match outcome.kind {
-                        OutcomeKind::Accepted => stats.record_accepted(1, outcome.latency_ms),
-                        OutcomeKind::Rejected => stats.record_rejected(1, outcome.latency_ms),
-                        OutcomeKind::Timeout => stats.record_timeout(1, outcome.latency_ms),
-                    },
+                    Ok(outcome) => {
+                        stats.record_backpressure(
+                            outcome.backpressure_429,
+                            outcome.backpressure_503,
+                        );
+                        match outcome.kind {
+                            OutcomeKind::Accepted => stats.record_accepted(1, outcome.latency_ms),
+                            OutcomeKind::Rejected => stats.record_rejected(1, outcome.latency_ms),
+                            OutcomeKind::Timeout => stats.record_timeout(1, outcome.latency_ms),
+                        }
+                    }
                     Err(e) => {
                         warn!("request error: {}", e);
                         stats.record_error(1);
@@ -534,11 +605,14 @@ async fn launch_window(
         tokio::spawn(async move {
             let _permit: OwnedSemaphorePermit = permit;
             match submitter.submit_payment(&base_url, &body).await {
-                Ok(outcome) => match outcome.kind {
-                    OutcomeKind::Accepted => stats.record_accepted(1, outcome.latency_ms),
-                    OutcomeKind::Rejected => stats.record_rejected(1, outcome.latency_ms),
-                    OutcomeKind::Timeout => stats.record_timeout(1, outcome.latency_ms),
-                },
+                Ok(outcome) => {
+                    stats.record_backpressure(outcome.backpressure_429, outcome.backpressure_503);
+                    match outcome.kind {
+                        OutcomeKind::Accepted => stats.record_accepted(1, outcome.latency_ms),
+                        OutcomeKind::Rejected => stats.record_rejected(1, outcome.latency_ms),
+                        OutcomeKind::Timeout => stats.record_timeout(1, outcome.latency_ms),
+                    }
+                }
                 Err(e) => {
                     warn!("request error: {}", e);
                     stats.record_error(1);
@@ -562,6 +636,8 @@ fn print_summary(result: &WorkerResult) {
     println!("Sent: {}", result.sent);
     println!("Accepted: {}", result.accepted);
     println!("Rejected: {}", result.rejected);
+    println!("Backpressure 429: {}", result.backpressure_429);
+    println!("Backpressure 503: {}", result.backpressure_503);
     println!("Errors: {}", result.errors);
     println!("Timeouts: {}", result.timeouts);
     println!("Achieved TPS: {}", result.achieved_tps);
@@ -665,6 +741,8 @@ struct WorkerStats {
     sent: AtomicU64,
     accepted: AtomicU64,
     rejected: AtomicU64,
+    backpressure_429: AtomicU64,
+    backpressure_503: AtomicU64,
     errors: AtomicU64,
     timeouts: AtomicU64,
     latency: AtomicHistogram,
@@ -678,6 +756,8 @@ impl WorkerStats {
             sent: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            backpressure_429: AtomicU64::new(0),
+            backpressure_503: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             timeouts: AtomicU64::new(0),
             latency: AtomicHistogram::new(60_000),
@@ -707,6 +787,18 @@ impl WorkerStats {
     }
 
     #[inline]
+    fn record_backpressure(&self, count_429: u64, count_503: u64) {
+        if count_429 != 0 {
+            self.backpressure_429
+                .fetch_add(count_429, Ordering::Relaxed);
+        }
+        if count_503 != 0 {
+            self.backpressure_503
+                .fetch_add(count_503, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
     fn record_timeout(&self, count: u64, latency_ms: u64) {
         self.timeouts.fetch_add(count, Ordering::Relaxed);
         self.latency.observe_ms(latency_ms);
@@ -728,6 +820,8 @@ impl WorkerStats {
             sent: self.sent.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
+            backpressure_429: self.backpressure_429.load(Ordering::Relaxed),
+            backpressure_503: self.backpressure_503.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             timeouts: self.timeouts.load(Ordering::Relaxed),
             latency_p50_ms: p50,
@@ -744,6 +838,8 @@ struct StatsSummary {
     sent: u64,
     accepted: u64,
     rejected: u64,
+    backpressure_429: u64,
+    backpressure_503: u64,
     errors: u64,
     timeouts: u64,
     latency_p50_ms: u64,
