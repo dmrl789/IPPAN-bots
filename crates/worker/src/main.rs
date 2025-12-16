@@ -267,7 +267,8 @@ impl PaymentSubmitter for MockPaymentSubmitter {
         &'a self,
         _base_url: &'a str,
         _body: &'a PaymentBody<'a>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>>
+    {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
             Ok(SubmitOutcome {
@@ -305,7 +306,8 @@ impl PaymentSubmitter for HttpPaymentSubmitter {
         &'a self,
         base_url: &'a str,
         body: &'a PaymentBody<'a>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SubmitOutcome>> + Send + 'a>>
+    {
         Box::pin(async move {
             let start = std::time::Instant::now();
             let endpoint = Self::endpoint(base_url);
@@ -326,14 +328,9 @@ impl PaymentSubmitter for HttpPaymentSubmitter {
                             .and_then(|v| v.get("tx_hash"))
                             .and_then(|v| v.as_str())
                             .is_some();
-                        let looks_like_error = parsed
-                            .as_ref()
-                            .and_then(|v| v.get("code"))
-                            .is_some()
-                            && parsed
-                                .as_ref()
-                                .and_then(|v| v.get("message"))
-                                .is_some();
+                        let looks_like_error =
+                            parsed.as_ref().and_then(|v| v.get("code")).is_some()
+                                && parsed.as_ref().and_then(|v| v.get("message")).is_some();
 
                         if has_tx_hash || (is_200 && !looks_like_error) {
                             Ok(SubmitOutcome {

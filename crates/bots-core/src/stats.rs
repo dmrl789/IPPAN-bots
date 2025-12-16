@@ -28,10 +28,7 @@ impl LatencyHistogram {
     }
 
     pub fn total_count(&self) -> u64 {
-        self.buckets
-            .iter()
-            .map(|b| b.load(Ordering::Relaxed))
-            .sum()
+        self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum()
     }
 
     pub fn percentile_ms(&self, p: u64) -> u64 {
