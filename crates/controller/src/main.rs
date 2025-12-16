@@ -12,7 +12,7 @@ use tracing::info;
 #[command(about = "IPPAN load rig controller - spawns workers locally and merges results")]
 struct Args {
     /// Path to configuration file
-    #[arg(long, default_value = "config/example.cluster.toml")]
+    #[arg(long, default_value = "config/example.local.toml")]
     config: PathBuf,
 
     /// Dry run: print what would be executed without running
@@ -20,12 +20,16 @@ struct Args {
     dry_run: bool,
 
     /// Spawn N local worker processes
-    #[arg(long)]
-    local: Option<u32>,
+    #[arg(long = "local-workers", alias = "local", default_value_t = 0)]
+    local_workers: u32,
 
     /// Only print the ramp schedule without running
     #[arg(long)]
     ramp_only: bool,
+
+    /// Merge an existing run's worker result JSONs without spawning workers.
+    #[arg(long)]
+    merge_run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,9 +90,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let local_n = args.local.unwrap_or(0);
+    let local_n = args.local_workers;
     if local_n == 0 {
-        info!("No --local N provided. For SSH-based orchestration, use scripts/run_cluster_ssh.sh");
+        if let Some(run_id) = args.merge_run_id.as_deref() {
+            let workers = collect_worker_results(run_id)?;
+            if workers.is_empty() {
+                anyhow::bail!("No worker results found for run_id={run_id}");
+            }
+            let merged = merge_results(run_id.to_string(), workers);
+            save_merged_results(&merged)?;
+            print_merged_summary(&merged);
+            return Ok(());
+        }
+
+        info!("No --local-workers N provided. For SSH-based orchestration, use scripts/run_cluster_ssh.sh");
         return Ok(());
     }
 
@@ -106,14 +121,17 @@ async fn main() -> Result<()> {
     );
 
     std::fs::create_dir_all("results").ok();
+    std::fs::create_dir_all("runs").ok();
 
     let mut handles = Vec::new();
     for i in 0..local_n {
         let worker_id = format!("worker-{}", i);
+        let worker_cfg_path =
+            write_worker_config(&config, local_n, i, &run_id).context("write worker config")?;
 
         let mut cmd = Command::new(&worker_bin);
         cmd.arg("--config")
-            .arg(&args.config)
+            .arg(&worker_cfg_path)
             .arg("--mode")
             .arg("http")
             .arg("--worker-id")
@@ -159,15 +177,8 @@ fn print_ramp_schedule(planner: &RampPlanner) {
     println!("Total duration: {}ms", planner.total_duration_ms());
     println!();
 
-    let start = std::time::Instant::now();
-    let windows = planner.plan(start);
-
-    for window in windows {
-        let duration_ms = window.end.duration_since(window.start).as_millis();
-        println!(
-            "Step {}: {} TPS for {}ms",
-            window.step_idx, window.tps, duration_ms
-        );
+    for (idx, step) in planner.steps().iter().enumerate() {
+        println!("Step {}: {} TPS for {}ms", idx, step.tps, step.hold_ms);
     }
     println!();
 }
@@ -187,6 +198,36 @@ fn print_dry_run(worker_bin: &Path, config: &Path, local_n: u32, run_id: &str) {
         );
     }
     println!();
+}
+
+fn split_tps(total: u64, workers: u32, worker_idx: u32) -> u64 {
+    if workers == 0 {
+        return 0;
+    }
+    let base = total / workers as u64;
+    let rem = total % workers as u64;
+    if (worker_idx as u64) < rem {
+        base.saturating_add(1)
+    } else {
+        base
+    }
+}
+
+fn write_worker_config(
+    base: &Config,
+    workers: u32,
+    worker_idx: u32,
+    run_id: &str,
+) -> Result<PathBuf> {
+    let mut cfg = base.clone();
+    for step in &mut cfg.ramp.steps {
+        step.tps = split_tps(step.tps, workers, worker_idx);
+    }
+
+    let out = PathBuf::from(format!("runs/run_{run_id}_worker_{worker_idx}.toml"));
+    let s = toml::to_string_pretty(&cfg)?;
+    std::fs::write(&out, s)?;
+    Ok(out)
 }
 
 fn infer_worker_binary() -> Result<PathBuf> {

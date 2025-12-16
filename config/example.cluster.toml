@@ -1,81 +1,31 @@
-# Example configuration for cluster/distributed testing
+# Example configuration for cluster/distributed testing.
+# (TOTAL TPS per ramp step; divide across workers externally.)
 
 [scenario]
-# Deterministic seed for reproducible runs
 seed = 12345
-
-# Optional global duration cap
-# duration_ms = 300000
-
-# Optional memo string
 memo = "cluster-load-test"
 
-# Ramp schedule: aggressive ramp for cluster testing
-[[ramp.steps]]
-tps = 1000
-hold_ms = 10000
-
-[[ramp.steps]]
-tps = 10000
-hold_ms = 20000
-
-[[ramp.steps]]
-tps = 50000
-hold_ms = 30000
-
-[[ramp.steps]]
-tps = 100000
-hold_ms = 60000
-
 [target]
-# Multiple RPC endpoints (worker will round-robin)
-# Replace with your actual IPPAN node API endpoints
 rpc_urls = [
-    "http://node1:8080",
-    "http://node2:8080",
-    "http://node3:8080"
+  "http://node1:8080",
+  "http://node2:8080",
+  "http://node3:8080"
 ]
-
-# Request timeout in milliseconds
-timeout_ms = 5000
-
-# Maximum concurrent in-flight requests (tune based on worker server capacity)
-max_in_flight = 50000
+timeout_ms = 3000
+max_in_flight = 2000
 
 [payment]
-# Source address (use test key only!)
-from = "test_from_address_placeholder"
+from = "@loadbank.ipn"
+to_list_path = "keys/recipients.json"
+amount_atomic = 1
+fee_atomic = 2000
+signing_key = "TEST_ONLY_KEY"
 
-# Destination mode: "round_robin" for distributed load
-to_mode = "round_robin"
-
-# Path to file with recipient addresses (one per line)
-to_list_path = "keys/recipient_addresses.txt"
-
-# For single mode (alternative):
-# to_mode = "single"
-# to_single = "test_to_address_placeholder"
-
-# Payment amount
-amount = "1000"
-
-# Signing key (CUSTODIAL SIGNING - use test key only!)
-signing_key = "test_signing_key_placeholder"
-
-[worker]
-# Worker identifier (will be overridden by controller with worker-0, worker-1, etc.)
-id = "worker-cluster"
-
-# Metrics endpoint binding
-bind_metrics = "0.0.0.0:9100"
-
-[controller]
-# For SSH orchestration mode (use scripts/run_cluster_ssh.sh)
-worker_hosts = [
-    "bot-server-1",
-    "bot-server-2",
-    "bot-server-3"
+[ramp]
+steps = [
+  { tps = 1000, hold_ms = 120000 },
+  { tps = 10000, hold_ms = 180000 },
+  { tps = 50000, hold_ms = 300000 },
+  { tps = 100000, hold_ms = 300000 },
+  { tps = 200000, hold_ms = 300000 }
 ]
-
-# For local testing mode (spawn N local worker processes)
-# local_workers = 4

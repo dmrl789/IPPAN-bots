@@ -5,6 +5,9 @@ set -euo pipefail
 # Usage: ./scripts/run_cluster_ssh.sh <config.toml>
 
 CONFIG=${1:-config/example.cluster.toml}
+RUN_ID=${RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")}
+REMOTE_DIR=${REMOTE_DIR:-/opt/ippan-bots}
+COLLECT_AFTER_SEC=${COLLECT_AFTER_SEC:-0}
 
 if [ ! -f "$CONFIG" ]; then
     echo "Error: Config file not found: $CONFIG"
@@ -15,16 +18,18 @@ echo "=== Building release binary ==="
 cargo build --release --bin worker
 
 BINARY="target/release/worker"
-WORKER_HOSTS=("bot-server-1" "bot-server-2" "bot-server-3")  # Update with your hosts
-REMOTE_DIR="/opt/ippan-bots"
+WORKER_HOSTS=("bot-server-1" "bot-server-2" "bot-server-3" "bot-server-4")  # Update with your hosts
 
 echo ""
 echo "=== Deploying to worker hosts ==="
 for host in "${WORKER_HOSTS[@]}"; do
     echo "Deploying to $host..."
-    ssh "$host" "mkdir -p $REMOTE_DIR/config $REMOTE_DIR/results"
+    ssh "$host" "mkdir -p $REMOTE_DIR/config $REMOTE_DIR/results $REMOTE_DIR/keys"
     scp "$BINARY" "$host:$REMOTE_DIR/"
     scp "$CONFIG" "$host:$REMOTE_DIR/config/config.toml"
+    if [ -f "keys/recipients.json" ]; then
+      scp "keys/recipients.json" "$host:$REMOTE_DIR/keys/recipients.json"
+    fi
 done
 
 echo ""
@@ -39,17 +44,27 @@ for i in "${!WORKER_HOSTS[@]}"; do
         --config config/config.toml \
         --mode http \
         --worker-id $worker_id \
+        --run-id $RUN_ID \
         > results/${worker_id}.log 2>&1 &"
 done
 
 echo ""
 echo "=== Workers started ==="
 echo "Monitor logs on each host: $REMOTE_DIR/results/worker-*.log"
+
+if [ "$COLLECT_AFTER_SEC" -gt 0 ]; then
+  echo ""
+  echo "=== Waiting ${COLLECT_AFTER_SEC}s before collecting results ==="
+  sleep "$COLLECT_AFTER_SEC"
+fi
+
 echo ""
-echo "To collect results, run:"
-echo "for host in ${WORKER_HOSTS[@]}; do"
-echo "  scp \$host:$REMOTE_DIR/results/worker_*.json results/"
-echo "done"
+echo "=== Collecting any worker results into ./results ==="
+mkdir -p results
+for host in "${WORKER_HOSTS[@]}"; do
+  scp "$host:$REMOTE_DIR/results/worker_*_${RUN_ID}.json" "results/" 2>/dev/null || true
+done
+
 echo ""
-echo "Then merge with controller:"
-echo "cargo run --release --bin controller -- --config $CONFIG"
+echo "=== If all workers have finished, merge with controller ==="
+echo "cargo run --release --bin controller -- --config $CONFIG --merge-run-id $RUN_ID"

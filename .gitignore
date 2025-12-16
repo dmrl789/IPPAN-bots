@@ -5,6 +5,7 @@ Cargo.lock
 
 # Outputs
 *.log
+*.json
 *.csv
 *.jsonl
 
@@ -15,13 +16,11 @@ Cargo.lock
 secrets/
 keys/
 
-# Runs / results
-runs/
-runs/**
+# Runs / results (keep directories via .gitkeep)
+runs/*
 !runs/.gitkeep
 
-results/
-results/**
+results/*
 !results/.gitkeep
 
 # IDE

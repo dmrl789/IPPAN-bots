@@ -1,26 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run a single local worker in mock mode, then HTTP mode
+# Build and run controller with 4 local workers.
+# Generates a throwaway recipients file if missing.
 
-echo "=== Building release binary ==="
-cargo build --release --bin worker
+WORKERS=${1:-4}
+CONFIG=${2:-config/example.local.toml}
+
+mkdir -p keys results runs
+
+if [ ! -f "keys/recipients.json" ]; then
+  echo "=== Creating keys/recipients.json (local-only, ignored by git) ==="
+  cat > keys/recipients.json <<'EOF'
+[
+  "@recipient1.ipn",
+  "@recipient2.ipn",
+  "@recipient3.ipn",
+  "@recipient4.ipn"
+]
+EOF
+fi
+
+echo "=== Building release binaries ==="
+cargo build --release --workspace
 
 echo ""
-echo "=== Running worker in MOCK mode (5 second test) ==="
-cargo run --release --bin worker -- \
-  --config config/test.toml \
-  --mode mock \
-  --worker-id worker-mock-test \
-  --print-every-ms 1000
+echo "=== Running controller with $WORKERS local workers ==="
+cargo run --release --bin controller -- \
+  --config "$CONFIG" \
+  --local-workers "$WORKERS"
 
 echo ""
-echo "=== Mock run complete ==="
-echo "Results written to results/worker_mock-test_*.json"
-
-echo ""
-echo "=== To run against real HTTP endpoint, update config and run: ==="
-echo "cargo run --release --bin worker -- \\"
-echo "  --config config/example.local.toml \\"
-echo "  --mode http \\"
-echo "  --worker-id worker-1"
+echo "=== Run complete ==="
+echo "Individual worker results: results/worker_*.json"
+echo "Merged results: results/run_*_merged.json"
