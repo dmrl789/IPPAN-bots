@@ -6,7 +6,7 @@ pub struct Config {
     pub scenario: ScenarioConfig,
     pub ramp: RampConfig,
     pub target: TargetConfig,
-    pub worker: WorkerConfig,
+    pub payment: PaymentConfig,
     #[serde(default)]
     pub controller: Option<ControllerConfig>,
 }
@@ -23,12 +23,10 @@ impl Config {
 pub struct ScenarioConfig {
     /// Deterministic seed for reproducible payload generation
     pub seed: u64,
-    /// Optional global duration cap in milliseconds
-    pub duration_ms: Option<u64>,
-    /// Fixed size for generated payloads in bytes
+    /// Desired payload size in bytes (used to deterministically pad memo/body)
     pub payload_bytes: u32,
-    /// Maximum transactions per batch (0 or 1 means no batching)
-    pub batch_max: u32,
+    /// Base memo string (will be capped to 256 bytes at runtime)
+    pub memo: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,12 +52,25 @@ pub struct TargetConfig {
     pub max_in_flight: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToMode {
+    RoundRobin,
+    Single,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerConfig {
-    /// Worker identifier for metrics and results
-    pub id: String,
-    /// Address to bind metrics endpoint (e.g., "127.0.0.1:9100")
-    pub bind_metrics: String,
+pub struct PaymentConfig {
+    pub from: String,
+    pub to_mode: ToMode,
+    /// Optional path to a newline-delimited list of recipients.
+    /// - `round_robin`: cycle through recipients
+    /// - `single`: always use the first recipient
+    #[serde(default)]
+    pub to_list_path: Option<String>,
+    pub amount: u128,
+    /// Custodial signing key passed to `/tx/payment` (test keys only)
+    pub signing_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +89,7 @@ mod tests {
 [scenario]
 seed = 42
 payload_bytes = 512
-batch_max = 10
+memo = "hello"
 
 [[ramp.steps]]
 tps = 1000
@@ -89,9 +100,12 @@ rpc_urls = ["http://localhost:8080"]
 timeout_ms = 5000
 max_in_flight = 1000
 
-[worker]
-id = "test-worker"
-bind_metrics = "127.0.0.1:9100"
+[payment]
+from = "from1"
+to_mode = "single"
+to_list_path = "secrets/to_list.txt"
+amount = 123
+signing_key = "test_key"
         "#;
 
         let config: Config = toml::from_str(config_str).unwrap();
@@ -99,6 +113,8 @@ bind_metrics = "127.0.0.1:9100"
         assert_eq!(config.scenario.payload_bytes, 512);
         assert_eq!(config.ramp.steps.len(), 1);
         assert_eq!(config.ramp.steps[0].tps, 1000);
-        assert_eq!(config.worker.id, "test-worker");
+        assert_eq!(config.payment.from, "from1");
+        assert_eq!(config.payment.to_mode, ToMode::Single);
+        assert_eq!(config.payment.amount, 123);
     }
 }
