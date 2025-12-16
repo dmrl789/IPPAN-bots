@@ -114,31 +114,25 @@ Example config (`config/example.local.toml`):
 ```toml
 [scenario]
 seed = 42
-memo = "load-test"
-
-[[ramp.steps]]
-tps = 1000
-hold_ms = 10000
-
-[[ramp.steps]]
-tps = 10000
-hold_ms = 20000
+memo = "ippan-load-test"
 
 [target]
 rpc_urls = ["http://127.0.0.1:8080"]
-timeout_ms = 5000
-max_in_flight = 10000
+timeout_ms = 3000
+max_in_flight = 2000
 
 [payment]
-from = "your_test_address"
-to_mode = "single"
-to_single = "recipient_test_address"
-amount = "1000"
-signing_key = "your_test_signing_key"
+from = "@loadbank.ipn"
+to_list_path = "keys/recipients.json"
+amount_atomic = 1
+fee_atomic = 2000
+signing_key = "TEST_ONLY_KEY"
 
-[worker]
-id = "worker-1"
-bind_metrics = "127.0.0.1:9100"
+[ramp]
+steps = [
+  { tps = 1000, hold_ms = 120000 },
+  { tps = 5000, hold_ms = 120000 }
+]
 ```
 
 ### Configuration Fields
@@ -146,10 +140,9 @@ bind_metrics = "127.0.0.1:9100"
 #### `[scenario]`
 
 - `seed` (u64): Deterministic seed for reproducible address selection
-- `duration_ms` (optional u64): Global duration cap
 - `memo` (string): Memo field for transactions (truncated to 256 bytes)
 
-#### `[[ramp.steps]]`
+#### `[ramp]`
 
 Each step has:
 - `tps` (u64): Target transactions per second for this step
@@ -164,21 +157,10 @@ Each step has:
 #### `[payment]`
 
 - `from`: Source address for payments
-- `to_mode`: "single" or "round_robin"
-- `to_single`: Single destination address (for "single" mode)
-- `to_list_path`: Path to file with destination addresses (for "round_robin" mode)
-- `amount`: Payment amount as string (u128)
+- `to_list_path`: Path to JSON file with destination addresses (round-robin)
+- `amount_atomic`: Payment amount (u128)
+- `fee_atomic`: Mandatory transaction fee (u128)
 - `signing_key`: Signing key for custodial signing (**use test keys only!**)
-
-#### `[worker]`
-
-- `id`: Worker identifier for metrics and results
-- `bind_metrics`: Address to bind metrics endpoint (optional)
-
-#### `[controller]`
-
-- `worker_hosts`: List of SSH hosts for orchestration
-- `local_workers`: Number of local worker processes to spawn
 
 ## Results Format
 

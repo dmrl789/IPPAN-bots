@@ -1,63 +1,30 @@
-# Example configuration for local single-worker testing
+# Example config (TOTAL TPS). Controller divides TPS across workers.
 
 [scenario]
-# Deterministic seed for reproducible runs
 seed = 42
-
-# Optional global duration cap (comment out for unlimited)
-# duration_ms = 60000
-
-# Optional memo string (will be truncated to 256 bytes)
-memo = "load-test"
-
-# Ramp schedule: gradually increase TPS
-[[ramp.steps]]
-tps = 1000
-hold_ms = 10000
-
-[[ramp.steps]]
-tps = 5000
-hold_ms = 10000
-
-[[ramp.steps]]
-tps = 10000
-hold_ms = 20000
+memo = "ippan-load-test"
 
 [target]
-# RPC endpoints (worker will round-robin)
-# Port 8080 is the HTTP API (used by bots)
-# Port 9000 is node-to-node P2P (NOT used by bots)
 rpc_urls = ["http://127.0.0.1:8080"]
-
-# Request timeout in milliseconds
-timeout_ms = 5000
-
-# Maximum concurrent in-flight requests
-max_in_flight = 10000
+timeout_ms = 3000
+max_in_flight = 2000
 
 [payment]
-# Source address (use test key only!)
-from = "test_from_address_placeholder"
+from = "@loadbank.ipn"
+to_list_path = "keys/recipients.json"
+amount_atomic = 1
+fee_atomic = 2000
+signing_key = "TEST_ONLY_KEY"
 
-# Destination mode: "single" or "round_robin"
-to_mode = "single"
-
-# For single mode: single destination address
-to_single = "test_to_address_placeholder"
-
-# For round_robin mode: path to file with list of addresses (one per line)
-# to_list_path = "keys/recipient_addresses.txt"
-
-# Payment amount (u128 as string)
-amount = "1000"
-
-# Signing key (CUSTODIAL SIGNING - use test key only!)
-# This is for /tx/payment endpoint (server-side signing)
-signing_key = "test_signing_key_placeholder"
-
-[worker]
-# Worker identifier
-id = "worker-1"
-
-# Metrics endpoint binding (optional)
-bind_metrics = "127.0.0.1:9100"
+[ramp]
+steps = [
+  { tps = 1000,   hold_ms = 120000 },
+  { tps = 5000,   hold_ms = 120000 },
+  { tps = 10000,  hold_ms = 180000 },
+  { tps = 20000,  hold_ms = 180000 },
+  { tps = 40000,  hold_ms = 300000 },
+  { tps = 80000,  hold_ms = 300000 },
+  { tps = 120000, hold_ms = 300000 },
+  { tps = 160000, hold_ms = 300000 },
+  { tps = 200000, hold_ms = 300000 }
+]

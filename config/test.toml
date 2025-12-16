@@ -4,9 +4,8 @@
 seed = 1
 memo = "test"
 
-[[ramp.steps]]
-tps = 100
-hold_ms = 1000
+[ramp]
+steps = [{ tps = 100, hold_ms = 1000 }]
 
 [target]
 rpc_urls = ["http://127.0.0.1:8080"]
@@ -15,11 +14,7 @@ max_in_flight = 100
 
 [payment]
 from = "test_from"
-to_mode = "single"
-to_single = "test_to"
-amount = "100"
+to_list_path = "keys/recipients.json"
+amount_atomic = 100
+fee_atomic = 2000
 signing_key = "test_key"
-
-[worker]
-id = "test-worker"
-bind_metrics = "127.0.0.1:9100"

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bots_core::{Config, RampPlanner, StatsCollector, ToMode};
+use bots_core::{Config, RampPlanner, StatsCollector};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -77,8 +77,7 @@ async fn main() -> Result<()> {
     );
     info!("Seed: {}", config.scenario.seed);
     info!(
-        "Payload bytes: {}, max_in_flight: {}, target_urls: {}",
-        config.scenario.payload_bytes,
+        "max_in_flight: {}, target_urls: {}",
         config.target.max_in_flight,
         config.target.rpc_urls.len()
     );
@@ -109,20 +108,9 @@ async fn run_load_test(
     let start_time = std::time::Instant::now();
     let stats = Arc::new(StatsCollector::new());
 
-    let amount: u128 = config.payment.amount.parse().with_context(|| {
-        format!(
-            "payment.amount must be a base-10 u128 string, got {:?}",
-            config.payment.amount
-        )
-    })?;
-
     let config = Arc::new(config);
     let recipients = Arc::new(load_recipients(config.as_ref())?);
-    info!(
-        "Recipients loaded: {} (to_mode={:?})",
-        recipients.len(),
-        config.payment.to_mode
-    );
+    info!("Recipients loaded: {}", recipients.len(),);
 
     let url_idx = Arc::new(AtomicUsize::new(0));
     let to_idx = Arc::new(AtomicUsize::new(0));
@@ -139,10 +127,9 @@ async fn run_load_test(
     let semaphore = Arc::new(Semaphore::new(config.target.max_in_flight as usize));
 
     let planner = RampPlanner::new(config.ramp.clone());
-    let windows = planner.plan(start_time);
     info!(
         "Planned {} ramp steps, total duration: {}ms",
-        windows.len(),
+        planner.steps().len(),
         planner.total_duration_ms()
     );
 
@@ -170,11 +157,11 @@ async fn run_load_test(
         }
     });
 
-    for window in windows {
-        let hold_ms = window.end.duration_since(window.start).as_millis() as u64;
+    for (step_idx, step) in planner.steps().iter().enumerate() {
+        let hold_ms = step.hold_ms;
         info!(
             "Starting step {}: {} TPS for {}ms",
-            window.step_idx, window.tps, hold_ms
+            step_idx, step.tps, hold_ms
         );
 
         let env = StepEnv {
@@ -185,10 +172,14 @@ async fn run_load_test(
             semaphore: semaphore.clone(),
             url_idx: url_idx.clone(),
             to_idx: to_idx.clone(),
-            amount,
+            from: config.payment.from.clone(),
+            signing_key: config.payment.signing_key.clone(),
+            memo_base: config.scenario.memo.clone(),
+            amount_atomic: config.payment.amount_atomic,
+            fee_atomic: config.payment.fee_atomic,
         };
 
-        run_ramp_step(&env, window.tps, hold_ms).await?;
+        run_ramp_step(&env, step.tps, hold_ms).await?;
     }
 
     info!("Waiting for in-flight requests to complete...");
@@ -227,14 +218,10 @@ async fn run_load_test(
 struct PaymentBody {
     from: String,
     to: String,
-    amount: u128,
+    amount: String,
+    fee: String,
     signing_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fee: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nonce: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    memo: Option<String>,
+    memo: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -324,37 +311,24 @@ impl PaymentSubmitter for HttpPaymentSubmitter {
                     let latency_ms = start.elapsed().as_millis() as u64;
                     let status = r.status();
 
-                    if status.is_success() {
-                        let is_200 = status.as_u16() == 200;
+                    // Spec:
+                    // - Success: HTTP 200 + `tx_hash`
+                    // - Error: non-2xx OR `{code,message}`
+                    let parsed: Option<serde_json::Value> = r.json().await.ok();
 
-                        // Best-effort parse: treat `{code,message}` as rejection, `tx_hash` as accept.
-                        let parsed: Option<serde_json::Value> = r.json().await.ok();
-                        let has_tx_hash = parsed
-                            .as_ref()
-                            .and_then(|v| v.get("tx_hash"))
-                            .and_then(|v| v.as_str())
-                            .is_some();
-                        let looks_like_error =
-                            parsed.as_ref().and_then(|v| v.get("code")).is_some()
-                                && parsed.as_ref().and_then(|v| v.get("message")).is_some();
+                    let has_tx_hash = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("tx_hash"))
+                        .and_then(|v| v.as_str())
+                        .is_some();
+                    let looks_like_error = parsed.as_ref().and_then(|v| v.get("code")).is_some()
+                        && parsed.as_ref().and_then(|v| v.get("message")).is_some();
 
-                        if has_tx_hash || (is_200 && !looks_like_error) {
-                            Ok(SubmitOutcome {
-                                kind: OutcomeKind::Accepted,
-                                latency_ms,
-                            })
-                        } else if is_200 {
-                            // Spec: HTTP 200 counts as success.
-                            Ok(SubmitOutcome {
-                                kind: OutcomeKind::Accepted,
-                                latency_ms,
-                            })
-                        } else {
-                            Ok(SubmitOutcome {
-                                kind: OutcomeKind::Rejected,
-                                latency_ms,
-                            })
-                        }
+                    if status.as_u16() == 200 && has_tx_hash && !looks_like_error {
+                        Ok(SubmitOutcome {
+                            kind: OutcomeKind::Accepted,
+                            latency_ms,
+                        })
                     } else {
                         Ok(SubmitOutcome {
                             kind: OutcomeKind::Rejected,
@@ -380,62 +354,132 @@ struct StepEnv {
     semaphore: Arc<Semaphore>,
     url_idx: Arc<AtomicUsize>,
     to_idx: Arc<AtomicUsize>,
-    amount: u128,
+    from: String,
+    signing_key: String,
+    memo_base: String,
+    amount_atomic: u128,
+    fee_atomic: u128,
 }
 
 async fn run_ramp_step(env: &StepEnv, tps: u64, hold_ms: u64) -> Result<()> {
-    let step_start = tokio::time::Instant::now();
-    let step_end = step_start + Duration::from_millis(hold_ms);
-
-    let planned_u128 = (tps as u128).saturating_mul(hold_ms as u128) / 1000u128;
-    let planned = planned_u128.min(u64::MAX as u128) as u64;
-    info!("Planned sends for step: {}", planned);
-
-    let mut scheduled = 0u64;
     let mut seq = 0u64;
 
-    while scheduled < planned {
-        let now = tokio::time::Instant::now();
-        let elapsed_ms = if now >= step_end {
-            hold_ms
-        } else {
-            now.duration_since(step_start).as_millis() as u64
-        };
+    let step_start = tokio::time::Instant::now();
+    let full_seconds = hold_ms / 1000;
+    let tail_ms = hold_ms % 1000;
 
-        let should_have = ((tps as u128).saturating_mul(elapsed_ms as u128) / 1000u128)
-            .min(u64::MAX as u128) as u64;
+    for sec in 0..full_seconds {
+        let window_start = step_start + Duration::from_millis(sec.saturating_mul(1000));
+        launch_window(env, tps, window_start, 1000, &mut seq).await?;
+    }
 
-        let mut to_launch = should_have.saturating_sub(scheduled);
-        if now >= step_end {
-            to_launch = planned.saturating_sub(scheduled);
+    if tail_ms > 0 {
+        let window_start = step_start + Duration::from_millis(full_seconds.saturating_mul(1000));
+        launch_window(env, tps, window_start, tail_ms, &mut seq).await?;
+    }
+
+    Ok(())
+}
+
+fn load_recipients(config: &Config) -> Result<Vec<String>> {
+    let path = config.payment.to_list_path.as_str();
+
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read {path:?}"))?;
+
+    // Accept either:
+    // - `["addr1","addr2", ...]`
+    // - `{ "recipients": ["addr1", ...] }`
+    let v: serde_json::Value =
+        serde_json::from_str(&content).context("recipients.json must be valid JSON")?;
+    let arr = if let Some(a) = v.as_array() {
+        a
+    } else if let Some(a) = v.get("recipients").and_then(|x| x.as_array()) {
+        a
+    } else {
+        anyhow::bail!(
+            "recipients.json must be a JSON array or an object with a 'recipients' array"
+        );
+    };
+
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item
+            .as_str()
+            .context("recipient entries must be strings")?
+            .trim();
+        if s.is_empty() {
+            continue;
         }
+        out.push(s.to_string());
+    }
 
+    if out.is_empty() {
+        anyhow::bail!("Recipient list at {path:?} is empty");
+    }
+
+    Ok(out)
+}
+
+fn choose_round_robin(items: &[String], idx: &AtomicUsize) -> String {
+    let i = idx.fetch_add(1, Ordering::Relaxed);
+    items[i % items.len()].clone()
+}
+
+fn build_memo(base: &str, seed: u64, seq: u64) -> String {
+    // Deterministic and stable; capped to 256 bytes.
+    let mut s = String::new();
+    s.push_str(base);
+    if !s.is_empty() {
+        s.push('|');
+    }
+    s.push_str("seed=");
+    s.push_str(&seed.to_string());
+    s.push_str("|seq=");
+    s.push_str(&seq.to_string());
+    if s.as_bytes().len() > 256 {
+        s.truncate(256);
+    }
+    s
+}
+
+async fn launch_window(
+    env: &StepEnv,
+    tps: u64,
+    window_start: tokio::time::Instant,
+    window_ms: u64,
+    seq: &mut u64,
+) -> Result<()> {
+    // Integer scheduler: exactly `tps` per full second.
+    // For partial windows (<1000ms), schedules floor(tps * window_ms / 1000).
+    let mut launched = 0u64;
+    let target_total =
+        ((tps as u128).saturating_mul(window_ms as u128) / 1000u128).min(u64::MAX as u128) as u64;
+
+    for ms in 0..window_ms {
+        let due = window_start + Duration::from_millis(ms);
+        tokio::time::sleep_until(due).await;
+
+        // desired by this millisecond (inclusive), in this window.
+        let desired = ((tps as u128).saturating_mul((ms + 1) as u128) / 1000u128)
+            .min(target_total as u128) as u64;
+        let mut to_launch = desired.saturating_sub(launched);
         while to_launch > 0 {
             let permit = env.semaphore.clone().acquire_owned().await?;
             env.stats.record_attempted(1);
             env.stats.record_sent(1);
 
             let base_url = choose_round_robin(&env.config.target.rpc_urls, &env.url_idx);
-            let to = choose_recipient(
-                env.config.payment.to_mode,
-                env.recipients.as_ref(),
-                &env.to_idx,
-            );
-            let memo = build_memo(
-                &env.config.scenario.memo,
-                env.config.scenario.payload_bytes,
-                env.config.scenario.seed,
-                seq,
-            );
+            let to = choose_round_robin(env.recipients.as_ref(), &env.to_idx);
+            let memo = build_memo(&env.memo_base, env.config.scenario.seed, *seq);
 
             let body = PaymentBody {
-                from: env.config.payment.from.clone(),
+                from: env.from.clone(),
                 to,
-                amount: env.amount,
-                signing_key: env.config.payment.signing_key.clone(),
-                fee: None,
-                nonce: None,
-                memo: Some(memo),
+                amount: env.amount_atomic.to_string(),
+                fee: env.fee_atomic.to_string(),
+                signing_key: env.signing_key.clone(),
+                memo,
             };
 
             let submitter = env.submitter.clone();
@@ -455,91 +499,54 @@ async fn run_ramp_step(env: &StepEnv, tps: u64, hold_ms: u64) -> Result<()> {
                 }
             });
 
-            scheduled = scheduled.saturating_add(1);
-            seq = seq.saturating_add(1);
+            launched = launched.saturating_add(1);
+            *seq = seq.saturating_add(1);
             to_launch -= 1;
         }
+    }
 
-        if scheduled >= planned {
-            break;
-        }
+    // If window_ms < 1000, `target_total` may be > desired at the last ms due to rounding.
+    // Launch any remaining deterministically at the end.
+    while launched < target_total {
+        let permit = env.semaphore.clone().acquire_owned().await?;
+        env.stats.record_attempted(1);
+        env.stats.record_sent(1);
 
-        if now < step_end {
-            let next_tick = step_start + Duration::from_millis(elapsed_ms.saturating_add(1));
-            tokio::time::sleep_until(next_tick).await;
-        } else {
-            tokio::task::yield_now().await;
-        }
+        let base_url = choose_round_robin(&env.config.target.rpc_urls, &env.url_idx);
+        let to = choose_round_robin(env.recipients.as_ref(), &env.to_idx);
+        let memo = build_memo(&env.memo_base, env.config.scenario.seed, *seq);
+
+        let body = PaymentBody {
+            from: env.from.clone(),
+            to,
+            amount: env.amount_atomic.to_string(),
+            fee: env.fee_atomic.to_string(),
+            signing_key: env.signing_key.clone(),
+            memo,
+        };
+
+        let submitter = env.submitter.clone();
+        let stats = env.stats.clone();
+        tokio::spawn(async move {
+            let _permit: OwnedSemaphorePermit = permit;
+            match submitter.submit_payment(&base_url, &body).await {
+                Ok(outcome) => match outcome.kind {
+                    OutcomeKind::Accepted => stats.record_accepted(1, outcome.latency_ms),
+                    OutcomeKind::Rejected => stats.record_rejected(1, outcome.latency_ms),
+                    OutcomeKind::Timeout => stats.record_timeout(1, outcome.latency_ms),
+                },
+                Err(e) => {
+                    warn!("request error: {}", e);
+                    stats.record_error(1);
+                }
+            }
+        });
+
+        launched = launched.saturating_add(1);
+        *seq = seq.saturating_add(1);
     }
 
     Ok(())
-}
-
-fn load_recipients(config: &Config) -> Result<Vec<String>> {
-    let path = config
-        .payment
-        .to_list_path
-        .as_deref()
-        .context("payment.to_list_path is required (newline-delimited recipients)")?;
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read recipients list at {path:?}"))?;
-
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let s = line.trim();
-        if s.is_empty() || s.starts_with('#') {
-            continue;
-        }
-        out.push(s.to_string());
-    }
-
-    if out.is_empty() {
-        anyhow::bail!("Recipient list at {path:?} is empty");
-    }
-
-    Ok(out)
-}
-
-fn choose_round_robin(items: &[String], idx: &AtomicUsize) -> String {
-    let i = idx.fetch_add(1, Ordering::Relaxed);
-    items[i % items.len()].clone()
-}
-
-fn choose_recipient(mode: ToMode, recipients: &[String], idx: &AtomicUsize) -> String {
-    match mode {
-        ToMode::Single => recipients[0].clone(),
-        ToMode::RoundRobin => {
-            let i = idx.fetch_add(1, Ordering::Relaxed);
-            recipients[i % recipients.len()].clone()
-        }
-    }
-}
-
-fn build_memo(base: &str, payload_bytes: u32, seed: u64, seq: u64) -> String {
-    // Memo is capped to 256 bytes; payload_bytes beyond that has no effect.
-    let target = (payload_bytes as usize).clamp(1, 256);
-
-    // Deterministic, cheap, and stable: base + `|seed=<seed>|seq=<seq>|` then 'a' padding.
-    let mut s = String::new();
-    s.push_str(base);
-    if !s.is_empty() {
-        s.push('|');
-    }
-    s.push_str("seed=");
-    s.push_str(&seed.to_string());
-    s.push_str("|seq=");
-    s.push_str(&seq.to_string());
-
-    while s.as_bytes().len() < target {
-        s.push('a');
-    }
-
-    if s.as_bytes().len() > 256 {
-        s.truncate(256);
-    }
-
-    s
 }
 
 fn print_summary(result: &WorkerResult) {

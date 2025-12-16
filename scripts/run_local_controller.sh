@@ -12,7 +12,7 @@ echo ""
 echo "=== Running controller with $WORKERS local workers ==="
 cargo run --release --bin controller -- \
   --config config/example.local.toml \
-  --local "$WORKERS"
+  --local-workers "$WORKERS"
 
 echo ""
 echo "=== Run complete ==="
