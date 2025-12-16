@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
-use bots_core::{Config, RampPlanner, StatsCollector};
+use bots_core::{Config, LatencyHistogram, RampPlanner};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
@@ -63,13 +65,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let config = Config::from_file(&args.config)
+    let config = load_config(&args.config)
         .with_context(|| format!("Failed to load config from {:?}", args.config))?;
 
-    let run_id = args
-        .run_id
-        .clone()
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string());
+    if args.mode == "http" {
+        validate_https_only(&config.target.rpc_urls)?;
+    }
+    validate_fee_nonzero(config.payment.fee_atomic)?;
+
+    let run_id = args.run_id.clone().unwrap_or_else(now_id);
 
     info!(
         "Starting worker '{}' (run_id={}) in {} mode",
@@ -106,7 +110,7 @@ async fn run_load_test(
     print_every_ms: u64,
 ) -> Result<WorkerResult> {
     let start_time = std::time::Instant::now();
-    let stats = Arc::new(StatsCollector::new());
+    let stats = Arc::new(WorkerStats::new());
 
     let config = Arc::new(config);
     let recipients = Arc::new(load_recipients(config.as_ref())?);
@@ -197,7 +201,7 @@ async fn run_load_test(
 
     Ok(WorkerResult {
         worker_id,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: now_id(),
         seed: config.scenario.seed,
         mode,
         duration_ms: elapsed_ms,
@@ -218,8 +222,8 @@ async fn run_load_test(
 struct PaymentBody {
     from: String,
     to: String,
-    amount: String,
-    fee: String,
+    amount: u128,
+    fee: u128,
     signing_key: String,
     memo: String,
 }
@@ -350,7 +354,7 @@ struct StepEnv {
     config: Arc<Config>,
     recipients: Arc<Vec<String>>,
     submitter: Arc<dyn PaymentSubmitter>,
-    stats: Arc<StatsCollector>,
+    stats: Arc<WorkerStats>,
     semaphore: Arc<Semaphore>,
     url_idx: Arc<AtomicUsize>,
     to_idx: Arc<AtomicUsize>,
@@ -476,8 +480,8 @@ async fn launch_window(
             let body = PaymentBody {
                 from: env.from.clone(),
                 to,
-                amount: env.amount_atomic.to_string(),
-                fee: env.fee_atomic.to_string(),
+                amount: env.amount_atomic,
+                fee: env.fee_atomic,
                 signing_key: env.signing_key.clone(),
                 memo,
             };
@@ -519,8 +523,8 @@ async fn launch_window(
         let body = PaymentBody {
             from: env.from.clone(),
             to,
-            amount: env.amount_atomic.to_string(),
-            fee: env.fee_atomic.to_string(),
+            amount: env.amount_atomic,
+            fee: env.fee_atomic,
             signing_key: env.signing_key.clone(),
             memo,
         };
@@ -565,4 +569,185 @@ fn print_summary(result: &WorkerResult) {
     println!("Latency p95: {}ms", result.latency_p95_ms);
     println!("Latency p99: {}ms", result.latency_p99_ms);
     println!();
+}
+
+fn load_config(path: &PathBuf) -> Result<Config> {
+    let s = std::fs::read_to_string(path)?;
+    let cfg: Config = toml::from_str(&s)?;
+    Ok(cfg)
+}
+
+fn now_id() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+        .to_string()
+}
+
+fn validate_fee_nonzero(fee_atomic: u128) -> Result<()> {
+    if fee_atomic == 0 {
+        anyhow::bail!("fee_atomic must be non-zero (fees are mandatory)");
+    }
+    Ok(())
+}
+
+fn validate_https_only(rpc_urls: &[String]) -> Result<()> {
+    if rpc_urls.is_empty() {
+        anyhow::bail!("target.rpc_urls must be non-empty");
+    }
+
+    for u in rpc_urls {
+        if !u.starts_with("https://") {
+            anyhow::bail!("RPC URL must be HTTPS (got {u})");
+        }
+
+        // Disallow explicit non-443 ports (node ports).
+        // Accept:
+        // - https://api1.ippan.uk
+        // - https://api1.ippan.uk:443
+        let rest = &u["https://".len()..];
+        let authority = rest.split('/').next().unwrap_or("");
+        if let Some((_, port_str)) = authority.rsplit_once(':') {
+            if !port_str.is_empty() {
+                let port: u16 = port_str
+                    .parse()
+                    .with_context(|| format!("Invalid port in RPC URL: {u}"))?;
+                if port != 443 {
+                    anyhow::bail!("RPC URL must not target node ports (got {u})");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct AtomicHistogram {
+    max_ms: u64,
+    buckets: Vec<AtomicU64>,
+}
+
+impl AtomicHistogram {
+    fn new(max_ms: u64) -> Self {
+        let len = (max_ms as usize).saturating_add(1).max(1);
+        let mut buckets = Vec::with_capacity(len);
+        for _ in 0..len {
+            buckets.push(AtomicU64::new(0));
+        }
+        Self { max_ms, buckets }
+    }
+
+    #[inline]
+    fn observe_ms(&self, latency_ms: u64) {
+        let idx = latency_ms.min(self.max_ms) as usize;
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn percentiles(&self) -> (u64, u64, u64) {
+        let mut h = LatencyHistogram::new(self.max_ms);
+        for (i, b) in self.buckets.iter().enumerate() {
+            let c = b.load(Ordering::Relaxed);
+            if c != 0 {
+                h.add_count_ms(i as u64, c);
+            }
+        }
+        (
+            h.percentile_ms(50),
+            h.percentile_ms(95),
+            h.percentile_ms(99),
+        )
+    }
+}
+
+struct WorkerStats {
+    start_time: std::time::Instant,
+    attempted: AtomicU64,
+    sent: AtomicU64,
+    accepted: AtomicU64,
+    rejected: AtomicU64,
+    errors: AtomicU64,
+    timeouts: AtomicU64,
+    latency: AtomicHistogram,
+}
+
+impl WorkerStats {
+    fn new() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            attempted: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            latency: AtomicHistogram::new(60_000),
+        }
+    }
+
+    #[inline]
+    fn record_attempted(&self, count: u64) {
+        self.attempted.fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_sent(&self, count: u64) {
+        self.sent.fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_accepted(&self, count: u64, latency_ms: u64) {
+        self.accepted.fetch_add(count, Ordering::Relaxed);
+        self.latency.observe_ms(latency_ms);
+    }
+
+    #[inline]
+    fn record_rejected(&self, count: u64, latency_ms: u64) {
+        self.rejected.fetch_add(count, Ordering::Relaxed);
+        self.latency.observe_ms(latency_ms);
+    }
+
+    #[inline]
+    fn record_timeout(&self, count: u64, latency_ms: u64) {
+        self.timeouts.fetch_add(count, Ordering::Relaxed);
+        self.latency.observe_ms(latency_ms);
+    }
+
+    #[inline]
+    fn record_error(&self, count: u64) {
+        self.errors.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis() as u64
+    }
+
+    fn summary(&self) -> StatsSummary {
+        let (p50, p95, p99) = self.latency.percentiles();
+        StatsSummary {
+            attempted: self.attempted.load(Ordering::Relaxed),
+            sent: self.sent.load(Ordering::Relaxed),
+            accepted: self.accepted.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            latency_p50_ms: p50,
+            latency_p95_ms: p95,
+            latency_p99_ms: p99,
+            duration_ms: self.elapsed_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatsSummary {
+    attempted: u64,
+    sent: u64,
+    accepted: u64,
+    rejected: u64,
+    errors: u64,
+    timeouts: u64,
+    latency_p50_ms: u64,
+    latency_p95_ms: u64,
+    latency_p99_ms: u64,
+    duration_ms: u64,
 }

@@ -4,6 +4,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tracing::info;
 
@@ -80,7 +81,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let config = Config::from_file(&args.config)
+    let config = load_config(&args.config)
         .with_context(|| format!("Failed to load config from {:?}", args.config))?;
 
     let planner = RampPlanner::new(config.ramp.clone());
@@ -107,13 +108,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let run_id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let worker_bin = infer_worker_binary().context("Failed to infer worker binary path")?;
+    let run_id = now_id();
 
     if args.dry_run {
+        let worker_bin = PathBuf::from("worker");
         print_dry_run(&worker_bin, &args.config, local_n, &run_id);
         return Ok(());
     }
+
+    let worker_bin = infer_worker_binary().context("Failed to infer worker binary path")?;
 
     info!(
         "Spawning {} local workers using {:?} (run_id={})",
@@ -170,6 +173,12 @@ async fn main() -> Result<()> {
     print_merged_summary(&merged);
 
     Ok(())
+}
+
+fn load_config(path: &PathBuf) -> Result<Config> {
+    let s = std::fs::read_to_string(path)?;
+    let cfg: Config = toml::from_str(&s)?;
+    Ok(cfg)
 }
 
 fn print_ramp_schedule(planner: &RampPlanner) {
@@ -325,7 +334,7 @@ fn merge_results(run_id: String, workers: Vec<WorkerResult>) -> MergedResult {
     let total_achieved_tps = workers.iter().map(|w| w.achieved_tps).sum();
 
     MergedResult {
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: now_id(),
         run_id,
         worker_count,
         total_duration_ms,
@@ -341,6 +350,14 @@ fn merge_results(run_id: String, workers: Vec<WorkerResult>) -> MergedResult {
         total_achieved_tps,
         workers,
     }
+}
+
+fn now_id() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+        .to_string()
 }
 
 fn save_merged_results(merged: &MergedResult) -> Result<()> {
