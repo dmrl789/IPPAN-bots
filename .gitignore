@@ -1,17 +1,27 @@
 # Rust
+/target/
 target/
 Cargo.lock
 
-# Logs and results
+# Outputs
 *.log
 *.csv
-runs/
-results/
 
-# Secrets
+# Local env
 .env
+
+# Secrets / keys (never commit)
 secrets/
 keys/
+
+# Runs / results
+runs/
+runs/**
+!runs/.gitkeep
+
+results/
+results/**
+!results/.gitkeep
 
 # IDE
 .idea/

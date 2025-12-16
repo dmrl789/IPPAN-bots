@@ -7,7 +7,7 @@ A distributed load testing system for IPPAN blockchain that can generate and sub
 This system consists of two main components:
 
 - **Worker**: Generates and sends transactions at a controlled rate with backpressure management, batching support, and detailed metrics tracking
-- **Controller**: Orchestrates multiple workers across machines, applies ramp schedules, and aggregates results
+- **Controller**: Orchestrates multiple workers across machines, applies ramp schedules, and aggregates results (v1: SSH orchestration, v2: HTTP control plane TODO)
 
 ## Features
 
@@ -44,13 +44,21 @@ cargo run --release --bin worker -- \
   --worker-id worker-1
 ```
 
+### View Ramp Schedule
+
+```bash
+cargo run --release --bin controller -- \
+  --config config/example.local.toml \
+  --ramp-only
+```
+
 ### Multi-Worker Cluster via SSH
 
 ```bash
 # Edit config/example.cluster.toml to set worker_hosts
 # Ensure SSH access and that worker binaries are deployed
 
-./scripts/run_cluster_ssh.sh
+./scripts/run_cluster_ssh.sh config/example.cluster.toml
 ```
 
 The controller will:
@@ -94,14 +102,14 @@ bind_metrics = "127.0.0.1:9100"
 ### Configuration Fields
 
 - **scenario**
-  - `seed`: Deterministic seed for payload generation
-  - `duration_ms`: Optional global duration cap
-  - `payload_bytes`: Fixed size for generated payloads
-  - `batch_max`: Maximum transactions per batch (0 or 1 = no batching)
+  - `seed` (u64): Deterministic seed for payload generation
+  - `duration_ms` (optional u64): Global duration cap
+  - `payload_bytes` (u32): Fixed size for generated payloads
+  - `batch_max` (u32): Maximum transactions per batch (0 or 1 = no batching)
 
-- **ramp.steps**
-  - `tps`: Target transactions per second for this step
-  - `hold_ms`: How long to maintain this rate
+- **ramp.steps**: Each step has:
+  - `tps` (u64): Target transactions per second for this step
+  - `hold_ms` (u64): How long to maintain this rate
 
 - **target**
   - `rpc_urls`: List of RPC endpoints (worker will round-robin)
@@ -111,6 +119,9 @@ bind_metrics = "127.0.0.1:9100"
 - **worker**
   - `id`: Worker identifier for metrics and results
   - `bind_metrics`: Address to bind metrics endpoint (optional)
+
+- **controller**
+  - `worker_hosts`: List of SSH hosts (v1) for orchestration
 
 ## RPC Adapter Note
 
@@ -132,6 +143,8 @@ cargo run --release --bin keygen -- \
   --count 1000 \
   --seed 12345
 ```
+
+Keys are stored in the `keys/` directory which is gitignored.
 
 ## Results Format
 
@@ -173,6 +186,14 @@ cargo test --all
 cargo fmt --all
 cargo clippy --all --all-targets -- -D warnings
 ```
+
+### CI
+
+GitHub Actions runs:
+
+- `cargo fmt --all --check`
+- `cargo clippy --all --all-targets -- -D warnings`
+- `cargo test --all`
 
 ## Project Structure
 
