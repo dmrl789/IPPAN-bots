@@ -90,5 +90,12 @@ fn main() -> Result<()> {
 }
 
 fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(data.len().saturating_mul(2));
+    for b in data {
+        // Writing into a pre-allocated String avoids clippy::format_collect.
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
 }

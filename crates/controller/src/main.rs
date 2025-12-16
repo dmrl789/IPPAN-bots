@@ -2,34 +2,38 @@ use anyhow::{Context, Result};
 use bots_core::{Config, RampPlanner};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tracing::{info, warn};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use tokio::process::Command;
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(name = "controller")]
-#[command(about = "IPPAN load test controller - orchestrates multiple workers")]
+#[command(about = "IPPAN load rig controller - spawns workers locally and merges results")]
 struct Args {
     /// Path to configuration file
     #[arg(long, default_value = "config/example.cluster.toml")]
     config: PathBuf,
 
-    /// Only print the ramp schedule without running
-    #[arg(long)]
-    ramp_only: bool,
-
     /// Dry run: print what would be executed without running
     #[arg(long)]
     dry_run: bool,
 
-    /// Number of local workers to spawn (overrides config)
+    /// Spawn N local worker processes
     #[arg(long)]
     local: Option<u32>,
+
+    /// Only print the ramp schedule without running
+    #[arg(long)]
+    ramp_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WorkerResult {
     worker_id: String,
     timestamp: String,
+    seed: u64,
+    mode: String,
     duration_ms: u64,
     attempted: u64,
     sent: u64,
@@ -46,6 +50,7 @@ struct WorkerResult {
 #[derive(Debug, Serialize, Deserialize)]
 struct MergedResult {
     timestamp: String,
+    run_id: String,
     worker_count: usize,
     total_duration_ms: u64,
     total_attempted: u64,
@@ -63,7 +68,6 @@ struct MergedResult {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -72,12 +76,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-
-    // Load configuration
     let config = Config::from_file(&args.config)
         .with_context(|| format!("Failed to load config from {:?}", args.config))?;
 
-    // Create ramp planner and display schedule
     let planner = RampPlanner::new(config.ramp.clone());
     print_ramp_schedule(&planner);
 
@@ -85,69 +86,70 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Determine mode: local or SSH
-    let local_workers = args
-        .local
-        .or_else(|| config.controller.as_ref().and_then(|c| c.local_workers));
-
-    if let Some(n) = local_workers {
-        info!("Running {} local workers", n);
-        if args.dry_run {
-            println!("\n=== Dry Run (Local Mode) ===");
-            println!("Would spawn {} local worker processes", n);
-            return Ok(());
-        }
-
-        run_local_workers(&config, n).await?;
-
-        // Collect and merge results
-        let results = collect_worker_results().await?;
-        if !results.is_empty() {
-            let merged = merge_results(results);
-            save_merged_results(&merged)?;
-            print_merged_summary(&merged);
-        } else {
-            info!("No worker results found.");
-        }
-    } else {
-        // SSH mode
-        let controller_config = config
-            .controller
-            .as_ref()
-            .context("Controller configuration is required")?;
-
-        let worker_hosts = controller_config
-            .worker_hosts
-            .as_ref()
-            .context("worker_hosts required for SSH mode")?;
-
-        info!(
-            "Controller will orchestrate {} workers via SSH",
-            worker_hosts.len()
-        );
-
-        if args.dry_run {
-            print_dry_run(&config, worker_hosts);
-            return Ok(());
-        }
-
-        // Note: Full SSH orchestration would be implemented here
-        // For now, we provide a script-based approach (see scripts/run_cluster_ssh.sh)
-        info!("Note: Use scripts/run_cluster_ssh.sh for SSH-based orchestration");
-        info!("Controller binary can be extended to handle SSH orchestration directly");
-
-        // Simulate collecting results (in real implementation, would collect from workers)
-        let results = collect_worker_results().await?;
-
-        if !results.is_empty() {
-            // Merge and save results
-            let merged = merge_results(results);
-            save_merged_results(&merged)?;
-            print_merged_summary(&merged);
-        } else {
-            info!("No worker results found. Run workers first.");
-        }
+    let local_n = args.local.unwrap_or(0);
+    if local_n == 0 {
+        info!("No --local N provided. For SSH-based orchestration, use scripts/run_cluster_ssh.sh");
+        return Ok(());
     }
+
+    let run_id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let worker_bin = infer_worker_binary().context("Failed to infer worker binary path")?;
+
+    if args.dry_run {
+        print_dry_run(&worker_bin, &args.config, local_n, &run_id);
+        return Ok(());
+    }
+
+    info!(
+        "Spawning {} local workers using {:?} (run_id={})",
+        local_n, worker_bin, run_id
+    );
+
+    std::fs::create_dir_all("results").ok();
+
+    let mut handles = Vec::new();
+    for i in 0..local_n {
+        let worker_id = format!("worker-{}", i);
+
+        let mut cmd = Command::new(&worker_bin);
+        cmd.arg("--config")
+            .arg(&args.config)
+            .arg("--mode")
+            .arg("http")
+            .arg("--worker-id")
+            .arg(&worker_id)
+            .arg("--run-id")
+            .arg(&run_id)
+            .arg("--print-every-ms")
+            .arg("1000")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn worker {worker_id}"))?;
+
+        handles.push(tokio::spawn(async move {
+            let status = child.wait().await?;
+            if !status.success() {
+                anyhow::bail!("Worker {worker_id} exited with status {status}");
+            }
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+
+    for h in handles {
+        h.await??;
+    }
+
+    let workers = collect_worker_results(&run_id)?;
+    if workers.is_empty() {
+        anyhow::bail!("No worker results found for run_id={run_id}");
+    }
+
+    let merged = merge_results(run_id.clone(), workers);
+    save_merged_results(&merged)?;
+    print_merged_summary(&merged);
 
     Ok(())
 }
@@ -170,114 +172,87 @@ fn print_ramp_schedule(planner: &RampPlanner) {
     println!();
 }
 
-fn print_dry_run(config: &Config, worker_hosts: &[String]) {
-    println!("\n=== Dry Run (SSH Mode) ===");
-    println!("Worker hosts: {:?}", worker_hosts);
-    println!("RPC targets: {:?}", config.target.rpc_urls);
-    println!("Max in-flight: {}", config.target.max_in_flight);
-    println!("Payment from: {}", config.payment.from);
-    println!("Seed: {}", config.scenario.seed);
+fn print_dry_run(worker_bin: &Path, config: &Path, local_n: u32, run_id: &str) {
+    println!("\n=== Dry Run ===");
+    println!("worker_bin: {:?}", worker_bin);
+    println!("config: {:?}", config);
+    println!("local workers: {}", local_n);
+    println!("run_id: {}", run_id);
     println!("\nWould execute:");
 
-    for (idx, host) in worker_hosts.iter().enumerate() {
+    for i in 0..local_n {
         println!(
-            "  ssh {} 'cd /path/to/worker && ./worker --worker-id worker-{} --config config.toml --mode http'",
-            host, idx
+            "  {:?} --config {:?} --mode http --worker-id worker-{} --run-id {} --print-every-ms 1000",
+            worker_bin, config, i, run_id
         );
     }
     println!();
 }
 
-async fn run_local_workers(config: &Config, n: u32) -> Result<()> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
-    info!("Spawning {} local workers...", n);
-
-    let mut handles = Vec::new();
-
-    // Write config to temp file
-    let config_path = "results/temp_config.toml";
-    std::fs::create_dir_all("results").ok();
-    let config_toml = toml::to_string_pretty(config)?;
-    std::fs::write(config_path, config_toml)?;
-
-    for i in 0..n {
-        let worker_id = format!("worker-{}", i);
-        info!("Starting {}", worker_id);
-
-        let mut cmd = Command::new("cargo");
-        cmd.args(["run", "--release", "--bin", "worker", "--"])
-            .arg("--config")
-            .arg(config_path)
-            .arg("--worker-id")
-            .arg(&worker_id)
-            .arg("--mode")
-            .arg("http")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        let handle = tokio::spawn(async move {
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    if let Err(e) = child.wait().await {
-                        warn!("Worker {} failed: {}", worker_id, e);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to spawn worker {}: {}", worker_id, e);
-                }
-            }
-        });
-
-        handles.push(handle);
+fn infer_worker_binary() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("WORKER_BIN") {
+        return Ok(PathBuf::from(p));
     }
 
-    // Wait for all workers to complete
-    for handle in handles {
-        let _ = handle.await;
+    let exe = std::env::current_exe()?;
+    let exe_dir = exe
+        .parent()
+        .context("current_exe has no parent directory")?;
+
+    // If running via cargo, controller is in target/{debug,release}/controller.
+    // Prefer sibling worker in the same directory.
+    let candidate = exe_dir.join("worker");
+    if candidate.exists() {
+        return Ok(candidate);
     }
 
-    // Clean up temp config
-    let _ = std::fs::remove_file(config_path);
+    for p in ["target/release/worker", "target/debug/worker"] {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Ok(pb);
+        }
+    }
 
-    info!("All workers completed");
-    Ok(())
+    anyhow::bail!("Could not find worker binary. Build it first (cargo build --bin worker).")
 }
 
-async fn collect_worker_results() -> Result<Vec<WorkerResult>> {
+fn collect_worker_results(run_id: &str) -> Result<Vec<WorkerResult>> {
     let mut results = Vec::new();
 
-    // Look for worker result files in results/ directory
     let results_dir = PathBuf::from("results");
     if !results_dir.exists() {
         return Ok(results);
     }
 
-    let entries = std::fs::read_dir(&results_dir)?;
-
-    for entry in entries {
+    for entry in std::fs::read_dir(&results_dir)? {
         let entry = entry?;
         let path = entry.path();
-
-        if path.extension().and_then(|s| s.to_str()) == Some("json")
-            && path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.starts_with("worker_"))
-                .unwrap_or(false)
-        {
-            info!("Found worker result: {:?}", path);
-            let content = std::fs::read_to_string(&path)?;
-            let result: WorkerResult = serde_json::from_str(&content)?;
-            results.push(result);
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
         }
+
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if !name.starts_with("worker_") {
+            continue;
+        }
+        if !name.ends_with(&format!("_{run_id}.json")) {
+            continue;
+        }
+
+        let content = std::fs::read_to_string(&path)?;
+        let result: WorkerResult = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {:?}", path))?;
+        results.push(result);
     }
 
     Ok(results)
 }
 
-fn merge_results(workers: Vec<WorkerResult>) -> MergedResult {
+fn merge_results(run_id: String, workers: Vec<WorkerResult>) -> MergedResult {
     let worker_count = workers.len();
 
     let total_attempted = workers.iter().map(|w| w.attempted).sum();
@@ -306,11 +281,11 @@ fn merge_results(workers: Vec<WorkerResult>) -> MergedResult {
     };
 
     let total_duration_ms = workers.iter().map(|w| w.duration_ms).max().unwrap_or(0);
-
     let total_achieved_tps = workers.iter().map(|w| w.achieved_tps).sum();
 
     MergedResult {
         timestamp: chrono::Utc::now().to_rfc3339(),
+        run_id,
         worker_count,
         total_duration_ms,
         total_attempted,
@@ -328,19 +303,19 @@ fn merge_results(workers: Vec<WorkerResult>) -> MergedResult {
 }
 
 fn save_merged_results(merged: &MergedResult) -> Result<()> {
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let output_path = format!("results/run_{}_merged.json", timestamp);
-
     std::fs::create_dir_all("results").ok();
-    let result_json = serde_json::to_string_pretty(&merged)?;
+    let output_path = format!("results/run_{}_merged.json", merged.run_id);
+    let result_json = serde_json::to_string_pretty(merged)?;
     std::fs::write(&output_path, result_json)?;
-
     info!("Merged results written to {}", output_path);
     Ok(())
 }
 
 fn print_merged_summary(merged: &MergedResult) {
-    println!("\n=== Merged Results ({} workers) ===", merged.worker_count);
+    println!(
+        "\n=== Merged Results ({} workers, run_id={}) ===",
+        merged.worker_count, merged.run_id
+    );
     println!("Total duration: {}ms", merged.total_duration_ms);
     println!("Total attempted: {}", merged.total_attempted);
     println!("Total sent: {}", merged.total_sent);
@@ -352,14 +327,5 @@ fn print_merged_summary(merged: &MergedResult) {
     println!("Avg latency p50: {}ms", merged.avg_latency_p50_ms);
     println!("Avg latency p95: {}ms", merged.avg_latency_p95_ms);
     println!("Avg latency p99: {}ms", merged.avg_latency_p99_ms);
-    println!();
-
-    println!("=== Per-Worker Breakdown ===");
-    for worker in &merged.workers {
-        println!(
-            "  {}: accepted={} tps={} p95={}ms",
-            worker.worker_id, worker.accepted, worker.achieved_tps, worker.latency_p95_ms
-        );
-    }
     println!();
 }

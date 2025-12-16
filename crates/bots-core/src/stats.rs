@@ -1,79 +1,125 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Statistics tracker with integer-based latency histogram
-#[derive(Clone)]
-pub struct StatsCollector {
-    pub attempted: u64,
-    pub sent: u64,
-    pub accepted: u64,
-    pub rejected: u64,
-    pub errors: u64,
-    pub timeouts: u64,
-    latency_buckets: Vec<u64>,
-    start_time: Instant,
+/// Integer-ms latency histogram backed by atomics for low-overhead hot-path updates.
+///
+/// Buckets are 1ms wide: bucket `i` counts observations with `latency_ms == i`,
+/// with the final bucket (`max_ms`) acting as a catch-all for any larger values.
+pub struct LatencyHistogram {
+    max_ms: u64,
+    buckets: Vec<AtomicU64>,
 }
 
-impl StatsCollector {
-    pub fn new() -> Self {
-        // Create histogram buckets: 0-1ms, 1-2ms, 2-5ms, 5-10ms, 10-20ms, ...
-        // Using powers and multiples for reasonable coverage
-        let buckets = vec![0; 100]; // Up to ~10 seconds
-        Self {
-            attempted: 0,
-            sent: 0,
-            accepted: 0,
-            rejected: 0,
-            errors: 0,
-            timeouts: 0,
-            latency_buckets: buckets,
-            start_time: Instant::now(),
+impl LatencyHistogram {
+    pub fn new(max_ms: u64) -> Self {
+        let len = (max_ms as usize).saturating_add(1).max(1);
+        let mut buckets = Vec::with_capacity(len);
+        for _ in 0..len {
+            buckets.push(AtomicU64::new(0));
         }
+        Self { max_ms, buckets }
     }
 
-    pub fn record_attempted(&mut self, count: u64) {
-        self.attempted += count;
+    #[inline]
+    pub fn observe_ms(&self, latency_ms: u64) {
+        let idx = latency_ms.min(self.max_ms) as usize;
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_sent(&mut self, count: u64) {
-        self.sent += count;
+    pub fn total_count(&self) -> u64 {
+        self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum()
     }
 
-    pub fn record_success(&mut self, accepted: u64, rejected: u64, timeouts: u64, latency_ms: u64) {
-        self.accepted += accepted;
-        self.rejected += rejected;
-        self.timeouts += timeouts;
-        self.record_latency(latency_ms);
-    }
-
-    pub fn record_error(&mut self, count: u64) {
-        self.errors += count;
-    }
-
-    fn record_latency(&mut self, latency_ms: u64) {
-        // Simple bucket assignment: use latency_ms directly capped at bucket length
-        let bucket_idx = latency_ms.min((self.latency_buckets.len() - 1) as u64) as usize;
-        self.latency_buckets[bucket_idx] += 1;
-    }
-
-    /// Calculate percentile from histogram (integer ms)
-    pub fn percentile(&self, p: u64) -> u64 {
-        let total: u64 = self.latency_buckets.iter().sum();
+    pub fn percentile_ms(&self, p: u64) -> u64 {
+        let p = p.clamp(0, 100);
+        let total = self.total_count();
         if total == 0 {
             return 0;
         }
 
-        let target = (total * p) / 100;
-        let mut cumulative = 0u64;
+        // Rank is 1-indexed: ceil(p/100 * total). For p=0, treat as 1 (min).
+        let rank = if p == 0 {
+            1
+        } else {
+            ((total.saturating_mul(p) + 99) / 100).max(1)
+        };
 
-        for (bucket_idx, &count) in self.latency_buckets.iter().enumerate() {
-            cumulative += count;
-            if cumulative >= target {
-                return bucket_idx as u64;
+        let mut cumulative = 0u64;
+        for (i, b) in self.buckets.iter().enumerate() {
+            cumulative = cumulative.saturating_add(b.load(Ordering::Relaxed));
+            if cumulative >= rank {
+                return i as u64;
             }
         }
+        self.max_ms
+    }
+}
 
-        self.latency_buckets.len() as u64
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        // 60s catch-all is enough for load-test latencies/timeouts.
+        Self::new(60_000)
+    }
+}
+
+/// Low-overhead counters + latency distribution for a run.
+pub struct StatsCollector {
+    start_time: Instant,
+    attempted: AtomicU64,
+    sent: AtomicU64,
+    accepted: AtomicU64,
+    rejected: AtomicU64,
+    errors: AtomicU64,
+    timeouts: AtomicU64,
+    latency: LatencyHistogram,
+}
+
+impl StatsCollector {
+    pub fn new() -> Self {
+        Self {
+            start_time: Instant::now(),
+            attempted: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            latency: LatencyHistogram::default(),
+        }
+    }
+
+    #[inline]
+    pub fn record_attempted(&self, count: u64) {
+        self.attempted.fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_sent(&self, count: u64) {
+        self.sent.fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_accepted(&self, count: u64, latency_ms: u64) {
+        self.accepted.fetch_add(count, Ordering::Relaxed);
+        self.latency.observe_ms(latency_ms);
+    }
+
+    #[inline]
+    pub fn record_rejected(&self, count: u64, latency_ms: u64) {
+        self.rejected.fetch_add(count, Ordering::Relaxed);
+        self.latency.observe_ms(latency_ms);
+    }
+
+    #[inline]
+    pub fn record_timeout(&self, count: u64, latency_ms: u64) {
+        self.timeouts.fetch_add(count, Ordering::Relaxed);
+        self.latency.observe_ms(latency_ms);
+    }
+
+    #[inline]
+    pub fn record_error(&self, count: u64) {
+        self.errors.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -82,15 +128,15 @@ impl StatsCollector {
 
     pub fn summary(&self) -> StatsSummary {
         StatsSummary {
-            attempted: self.attempted,
-            sent: self.sent,
-            accepted: self.accepted,
-            rejected: self.rejected,
-            errors: self.errors,
-            timeouts: self.timeouts,
-            latency_p50_ms: self.percentile(50),
-            latency_p95_ms: self.percentile(95),
-            latency_p99_ms: self.percentile(99),
+            attempted: self.attempted.load(Ordering::Relaxed),
+            sent: self.sent.load(Ordering::Relaxed),
+            accepted: self.accepted.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            latency_p50_ms: self.latency.percentile_ms(50),
+            latency_p95_ms: self.latency.percentile_ms(95),
+            latency_p99_ms: self.latency.percentile_ms(99),
             duration_ms: self.elapsed_ms(),
         }
     }
@@ -121,38 +167,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stats_collector_basic() {
-        let mut stats = StatsCollector::new();
+    fn test_histogram_percentiles_are_stable() {
+        let h = LatencyHistogram::new(1_000);
 
-        stats.record_attempted(100);
-        stats.record_sent(100);
-        stats.record_success(95, 5, 0, 10);
+        // 100 samples:
+        // - 50 at 10ms
+        // - 30 at 20ms
+        // - 20 at 50ms
+        for _ in 0..50 {
+            h.observe_ms(10);
+        }
+        for _ in 0..30 {
+            h.observe_ms(20);
+        }
+        for _ in 0..20 {
+            h.observe_ms(50);
+        }
 
-        assert_eq!(stats.attempted, 100);
-        assert_eq!(stats.sent, 100);
-        assert_eq!(stats.accepted, 95);
-        assert_eq!(stats.rejected, 5);
+        assert_eq!(h.total_count(), 100);
+        assert_eq!(h.percentile_ms(50), 10);
+        assert_eq!(h.percentile_ms(95), 50);
+        assert_eq!(h.percentile_ms(99), 50);
     }
 
     #[test]
-    fn test_percentile_calculation() {
-        let mut stats = StatsCollector::new();
+    fn test_stats_collector_basic() {
+        let s = StatsCollector::new();
+        s.record_attempted(100);
+        s.record_sent(100);
+        s.record_accepted(95, 10);
+        s.record_rejected(5, 20);
 
-        // Record 100 samples at various latencies
-        for _ in 0..50 {
-            stats.record_success(1, 0, 0, 10);
-        }
-        for _ in 0..30 {
-            stats.record_success(1, 0, 0, 20);
-        }
-        for _ in 0..20 {
-            stats.record_success(1, 0, 0, 50);
-        }
-
-        let p50 = stats.percentile(50);
-        let p95 = stats.percentile(95);
-
-        assert!(p50 <= 20, "p50 should be around 10-20ms, got {}", p50);
-        assert!(p95 >= 20, "p95 should be >= 20ms, got {}", p95);
+        let summary = s.summary();
+        assert_eq!(summary.attempted, 100);
+        assert_eq!(summary.sent, 100);
+        assert_eq!(summary.accepted, 95);
+        assert_eq!(summary.rejected, 5);
+        assert!(summary.latency_p50_ms >= 10);
     }
 }
