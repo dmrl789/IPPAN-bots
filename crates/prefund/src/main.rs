@@ -110,4 +110,3 @@ fn now_id() -> String {
         .as_secs()
         .to_string()
 }
-

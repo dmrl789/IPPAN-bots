@@ -220,9 +220,20 @@ fn print_per_worker_tps_plan(planner: &RampPlanner, workers: u32) {
 
     for (idx, step) in planner.steps().iter().enumerate() {
         let total = step.tps;
-        let base = if workers == 0 { 0 } else { total / workers as u64 };
-        let rem = if workers == 0 { 0 } else { total % workers as u64 };
-        println!("Step {}: total_tps={} (base={} rem={})", idx, total, base, rem);
+        let base = if workers == 0 {
+            0
+        } else {
+            total / workers as u64
+        };
+        let rem = if workers == 0 {
+            0
+        } else {
+            total % workers as u64
+        };
+        println!(
+            "Step {}: total_tps={} (base={} rem={})",
+            idx, total, base, rem
+        );
 
         // Integer division + remainder distribution: first `rem` workers get +1.
         let mut parts = Vec::with_capacity(workers as usize);

@@ -364,8 +364,9 @@ impl PaymentSubmitter for HttpPaymentSubmitter {
                             .and_then(|v| v.get("tx_hash"))
                             .and_then(|v| v.as_str())
                             .is_some();
-                        let looks_like_error = parsed.as_ref().and_then(|v| v.get("code")).is_some()
-                            && parsed.as_ref().and_then(|v| v.get("message")).is_some();
+                        let looks_like_error =
+                            parsed.as_ref().and_then(|v| v.get("code")).is_some()
+                                && parsed.as_ref().and_then(|v| v.get("message")).is_some();
 
                         let latency_ms = start_all.elapsed().as_millis() as u64;
                         if status_u16 == 200 && has_tx_hash && !looks_like_error {
@@ -556,7 +557,10 @@ async fn launch_window(
                 let _permit: OwnedSemaphorePermit = permit;
                 match submitter.submit_payment(&base_url, &body).await {
                     Ok(outcome) => {
-                        stats.record_backpressure(outcome.backpressure_429, outcome.backpressure_503);
+                        stats.record_backpressure(
+                            outcome.backpressure_429,
+                            outcome.backpressure_503,
+                        );
                         match outcome.kind {
                             OutcomeKind::Accepted => stats.record_accepted(1, outcome.latency_ms),
                             OutcomeKind::Rejected => stats.record_rejected(1, outcome.latency_ms),
@@ -785,10 +789,12 @@ impl WorkerStats {
     #[inline]
     fn record_backpressure(&self, count_429: u64, count_503: u64) {
         if count_429 != 0 {
-            self.backpressure_429.fetch_add(count_429, Ordering::Relaxed);
+            self.backpressure_429
+                .fetch_add(count_429, Ordering::Relaxed);
         }
         if count_503 != 0 {
-            self.backpressure_503.fetch_add(count_503, Ordering::Relaxed);
+            self.backpressure_503
+                .fetch_add(count_503, Ordering::Relaxed);
         }
     }
 

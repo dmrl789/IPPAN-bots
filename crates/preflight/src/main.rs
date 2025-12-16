@@ -29,10 +29,14 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to load config from {:?}", args.config))?;
 
     // Deterministic allow-list: Deventer run is fixed to 4 API hosts.
-    let allowed_hosts: BTreeSet<&'static str> =
-        ["api1.ippan.uk", "api2.ippan.uk", "api3.ippan.uk", "api4.ippan.uk"]
-            .into_iter()
-            .collect();
+    let allowed_hosts: BTreeSet<&'static str> = [
+        "api1.ippan.uk",
+        "api2.ippan.uk",
+        "api3.ippan.uk",
+        "api4.ippan.uk",
+    ]
+    .into_iter()
+    .collect();
 
     info!("Validating config RPC URLs...");
     let mut base_urls = Vec::new();
@@ -103,14 +107,10 @@ fn validate_rpc_url(raw: &str, allowed_hosts: &BTreeSet<&'static str>) -> Result
         anyhow::bail!("RPC URL must not include credentials (got {raw})");
     }
 
-    let host = url
-        .host_str()
-        .context("RPC URL must include a hostname")?;
+    let host = url.host_str().context("RPC URL must include a hostname")?;
 
     if !allowed_hosts.contains(host) {
-        anyhow::bail!(
-            "RPC URL host must be one of api1..api4.ippan.uk (got host={host})"
-        );
+        anyhow::bail!("RPC URL host must be one of api1..api4.ippan.uk (got host={host})");
     }
 
     if host.parse::<std::net::IpAddr>().is_ok() {
@@ -200,4 +200,3 @@ async fn check_status_best_effort(
 
     Ok(())
 }
-
