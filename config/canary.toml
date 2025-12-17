@@ -1,0 +1,23 @@
+[scenario]
+seed = 42
+memo = "ippan-load-test-canary"
+
+[target]
+rpc_urls = [
+  "https://api1.ippan.uk",
+  "https://api2.ippan.uk",
+  "https://api3.ippan.uk",
+  "https://api4.ippan.uk"
+]
+timeout_ms = 3000
+max_in_flight = 2000
+
+[payment]
+from = "@loadbank.ipn"
+to_list_path = "keys/recipients.json"
+amount_atomic = 1
+fee_atomic = 2000
+signing_key = "TEST_ONLY_KEY"
+
+[ramp]
+steps = [{ tps = 1, hold_ms = 5000 }]
