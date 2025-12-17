@@ -28,10 +28,11 @@ Before any real run (especially distributed), run the preflight checks against y
 cargo run --bin preflight -- --config config/example.deventer.toml
 ```
 
-### Port Usage
+### HTTPS-only (no node ports)
 
-- **Port 8080**: IPPAN HTTP API endpoint (used by bots for `/tx/payment`)
-- **Port 9000**: Node-to-node P2P (NOT used by bots)
+- Bots must use **HTTPS** base URLs only (e.g. `https://api1.ippan.uk`)
+- Do **not** target node ports or raw IPs from bots
+- The worker appends the fixed path **`/tx/payment`** to the base URL
 
 ### Transaction Signing
 
@@ -77,7 +78,7 @@ cargo run --release --bin worker -- \
 ```
 
 Make sure to:
-1. Update `config/example.local.toml` with your IPPAN node URL
+1. Update `config/example.local.toml` with your **HTTPS** IPPAN API base URL
 2. Set proper `from`, `to`, `amount`, and `signing_key` values
 3. Use test keys only!
 
@@ -126,8 +127,8 @@ This prints a deterministic prefund estimate and writes `results/prefund_<timest
 
 1. DNS/TLS sanity:
    - `api1..api4.ippan.uk` resolve to the expected IPs
-2. Proxy config:
-   - `/tx/payment` → `127.0.0.1:8080`
+2. Ingress routing:
+   - HTTPS ingress serves `/tx/payment` on `https://api1..api4.ippan.uk`
 3. Preflight:
    - `cargo run --bin preflight -- --config config/example.deventer.toml`
 4. Prefund:
@@ -149,7 +150,7 @@ seed = 42
 memo = "ippan-load-test"
 
 [target]
-rpc_urls = ["http://127.0.0.1:8080"]
+rpc_urls = ["https://api1.ippan.uk"]
 timeout_ms = 3000
 max_in_flight = 2000
 
@@ -273,9 +274,9 @@ Expected request body:
 {
   "from": "source_address",
   "to": "destination_address",
-  "amount": "1000",
+  "amount": 1000,
   "signing_key": "your_key",
-  "fee": "10",           // optional
+  "fee": 10,
   "nonce": 123,          // optional
   "memo": "test"         // optional, max 256 bytes
 }

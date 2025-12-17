@@ -8,7 +8,7 @@ memo = "test"
 steps = [{ tps = 100, hold_ms = 1000 }]
 
 [target]
-rpc_urls = ["http://127.0.0.1:8080"]
+rpc_urls = ["https://api1.ippan.uk"]
 timeout_ms = 1000
 max_in_flight = 100
 

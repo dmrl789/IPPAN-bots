@@ -49,9 +49,10 @@ Successfully implemented a minimal, reproducible **controller + worker** load ri
 - JSON POST body with:
   - `from`: source address
   - `to`: destination address (single or round-robin)
-  - `amount`: u128 as string
+  - `amount`: integer atomic units (u128)
   - `signing_key`: custodial signing key
-  - `fee`, `nonce`, `memo`: optional fields
+  - `fee`: mandatory field
+  - `nonce`, `memo`: optional fields
 - Response handling:
   - Success: HTTP 200 + `tx_hash` field
   - Error: non-2xx or `code`/`error` fields
@@ -97,7 +98,7 @@ tps = 10000
 hold_ms = 20000
 
 [target]
-rpc_urls = ["http://127.0.0.1:8080"]
+rpc_urls = ["https://api1.ippan.uk"]
 timeout_ms = 5000
 max_in_flight = 10000
 
