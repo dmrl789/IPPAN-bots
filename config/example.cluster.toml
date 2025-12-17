@@ -7,9 +7,9 @@ memo = "cluster-load-test"
 
 [target]
 rpc_urls = [
-  "http://node1:8080",
-  "http://node2:8080",
-  "http://node3:8080"
+  "https://api1.ippan.uk",
+  "https://api2.ippan.uk",
+  "https://api3.ippan.uk"
 ]
 timeout_ms = 3000
 max_in_flight = 2000
