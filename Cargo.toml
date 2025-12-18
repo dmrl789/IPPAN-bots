@@ -3,8 +3,6 @@ members = [
     "crates/bots-core",
     "crates/worker",
     "crates/controller",
-    "crates/preflight",
-    "crates/prefund",
 ]
 resolver = "2"
 

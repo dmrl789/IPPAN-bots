@@ -5,7 +5,7 @@ seed = 42
 memo = "ippan-load-test"
 
 [target]
-rpc_urls = ["https://api1.ippan.uk"]
+rpc_urls = ["http://127.0.0.1:8080"]
 timeout_ms = 3000
 max_in_flight = 2000
 
