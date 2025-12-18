@@ -46,11 +46,26 @@ pub struct TargetConfig {
 pub struct PaymentConfig {
     pub from: String,
     pub to_list_path: String,
-    #[serde(deserialize_with = "de_u128_any")]
+    // TOML (via `toml` crate) does not support serializing u128, but we need u128 at runtime.
+    // Serialize as base-10 strings, while accepting either integer or string on input.
+    #[serde(
+        serialize_with = "ser_u128_as_string",
+        deserialize_with = "de_u128_any"
+    )]
     pub amount_atomic: u128,
-    #[serde(deserialize_with = "de_u128_any")]
+    #[serde(
+        serialize_with = "ser_u128_as_string",
+        deserialize_with = "de_u128_any"
+    )]
     pub fee_atomic: u128,
     pub signing_key: String,
+}
+
+fn ser_u128_as_string<S>(v: &u128, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&v.to_string())
 }
 
 fn de_u128_any<'de, D>(deserializer: D) -> Result<u128, D::Error>
@@ -253,6 +268,38 @@ steps = [
         assert_eq!(cfg.ramp.steps[1].hold_ms, 120000);
         assert_eq!(cfg.payment.amount_atomic, 1);
         assert_eq!(cfg.payment.fee_atomic, 2000);
+    }
+
+    #[test]
+    fn payment_u128_serializes_as_string_for_toml() {
+        let cfg = Config {
+            scenario: ScenarioConfig {
+                seed: 42,
+                memo: "m".to_string(),
+            },
+            ramp: RampConfig {
+                steps: vec![RampStep {
+                    tps: 1,
+                    hold_ms: 1000,
+                }],
+            },
+            target: TargetConfig {
+                rpc_urls: vec!["http://127.0.0.1:8080".to_string()],
+                timeout_ms: 3000,
+                max_in_flight: 1,
+            },
+            payment: PaymentConfig {
+                from: "@a.ipn".to_string(),
+                to_list_path: "keys/recipients.json".to_string(),
+                amount_atomic: 1u128,
+                fee_atomic: 2000u128,
+                signing_key: "k".to_string(),
+            },
+        };
+
+        let s = toml::to_string_pretty(&cfg).expect("config should serialize to TOML");
+        assert!(s.contains("amount_atomic = \"1\""));
+        assert!(s.contains("fee_atomic = \"2000\""));
     }
 
     #[test]

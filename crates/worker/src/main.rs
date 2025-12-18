@@ -70,9 +70,7 @@ async fn main() -> Result<()> {
     let config = load_config(&args.config)
         .with_context(|| format!("Failed to load config from {:?}", args.config))?;
 
-    if args.mode == "http" {
-        validate_https_only(&config.target.rpc_urls)?;
-    }
+    validate_target_urls(&config.target.rpc_urls)?;
     validate_fee_nonzero(config.payment.fee_atomic)?;
 
     let run_id = args.run_id.clone().unwrap_or_else(now_id);
@@ -118,8 +116,13 @@ async fn run_load_test(
     let recipients = Arc::new(load_recipients(config.as_ref())?);
     info!("Recipients loaded: {}", recipients.len(),);
 
-    let url_idx = Arc::new(AtomicUsize::new(0));
-    let to_idx = Arc::new(AtomicUsize::new(0));
+    // Deterministic starting offsets derived from the explicit seed.
+    let url_idx = Arc::new(AtomicUsize::new(
+        (config.scenario.seed as usize) % config.target.rpc_urls.len().max(1),
+    ));
+    let to_idx = Arc::new(AtomicUsize::new(
+        (config.scenario.seed as usize) % recipients.len().max(1),
+    ));
 
     let submitter: Arc<dyn PaymentSubmitter> = match mode.as_str() {
         "mock" => Arc::new(MockPaymentSubmitter::new(5)),
@@ -668,32 +671,9 @@ fn validate_fee_nonzero(fee_atomic: u128) -> Result<()> {
     Ok(())
 }
 
-fn validate_https_only(rpc_urls: &[String]) -> Result<()> {
+fn validate_target_urls(rpc_urls: &[String]) -> Result<()> {
     if rpc_urls.is_empty() {
         anyhow::bail!("target.rpc_urls must be non-empty");
-    }
-
-    for u in rpc_urls {
-        if !u.starts_with("https://") {
-            anyhow::bail!("RPC URL must be HTTPS (got {u})");
-        }
-
-        // Disallow explicit non-443 ports (node ports).
-        // Accept:
-        // - https://api1.ippan.uk
-        // - https://api1.ippan.uk:443
-        let rest = &u["https://".len()..];
-        let authority = rest.split('/').next().unwrap_or("");
-        if let Some((_, port_str)) = authority.rsplit_once(':') {
-            if !port_str.is_empty() {
-                let port: u16 = port_str
-                    .parse()
-                    .with_context(|| format!("Invalid port in RPC URL: {u}"))?;
-                if port != 443 {
-                    anyhow::bail!("RPC URL must not target node ports (got {u})");
-                }
-            }
-        }
     }
     Ok(())
 }

@@ -4,8 +4,10 @@ memo = "ippan-load-test-eu-short"
 
 [target]
 rpc_urls = [
-  "https://api1.ippan.uk",
-  "https://api2.ippan.uk"
+  "http://api1.ippan.uk:8080",
+  "http://api2.ippan.uk:8080",
+  "http://api3.ippan.uk:8080",
+  "http://api4.ippan.uk:8080"
 ]
 timeout_ms = 3000
 max_in_flight = 2000
