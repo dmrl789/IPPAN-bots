@@ -19,20 +19,7 @@ This system consists of:
 - **Metrics**: Per-worker statistics with latency percentiles (p50/p95/p99) in integer ms
 
 ## Important Notes
-
-### Always run preflight before load tests
-
-Before any real run (especially distributed), run the preflight checks against your configured `rpc_urls`:
-
-```bash
-cargo run --bin preflight -- --config config/example.deventer.toml
-```
-
-### HTTPS-only (no node ports)
-
-- Bots must use **HTTPS** base URLs only (e.g. `https://api1.ippan.uk`)
-- Do **not** target node ports or raw IPs from bots
-- The worker appends the fixed path **`/tx/payment`** to the base URL
+The worker appends the fixed path **`/tx/payment`** to each configured base URL.
 
 ### Transaction Signing
 
@@ -53,20 +40,26 @@ This repo is designed to **measure** where bottlenecks are before changing IPPAN
 
 ## Quickstart
 
+### Local Run (4 workers) against IPPAN HTTP API
+
+```bash
+./scripts/run_local.sh 4 config/example.local.toml
+```
+
+This will build release binaries, spawn 4 local worker processes, and write:
+- `results/worker_<id>_<run_id>.json`
+- `results/run_<run_id>_merged.json`
+
+Your IPPAN HTTP API must be reachable at the configured `rpc_urls` (for local: `http://127.0.0.1:8080`).
+
 ### Local Dry-Run (Mock Mode)
 
 ```bash
-# Build the workspace
-cargo build --release
-
-# Run a single worker in mock mode (no real RPC calls)
-./scripts/run_local.sh
+cargo run --release --bin worker -- \
+  --config config/example.local.toml \
+  --mode mock \
+  --worker-id worker-1
 ```
-
-This will:
-- Generate deterministic payment transactions
-- Simulate submission with configurable latency
-- Write results to `results/worker_*.json`
 
 ### Local Worker Against Real RPC
 
@@ -77,10 +70,7 @@ cargo run --release --bin worker -- \
   --worker-id worker-1
 ```
 
-Make sure to:
-1. Update `config/example.local.toml` with your **HTTPS** IPPAN API base URL
-2. Set proper `from`, `to`, `amount`, and `signing_key` values
-3. Use test keys only!
+Make sure to set proper `from`, recipients, and `signing_key` values (use test keys only).
 
 ### Multi-Worker Local Testing
 
@@ -150,7 +140,7 @@ seed = 42
 memo = "ippan-load-test"
 
 [target]
-rpc_urls = ["https://api1.ippan.uk"]
+rpc_urls = ["http://127.0.0.1:8080"]
 timeout_ms = 3000
 max_in_flight = 2000
 
@@ -256,8 +246,6 @@ GitHub Actions runs:
 │   ├── bots-core/       # Shared types, rate limiter, ramp planner, stats
 │   ├── worker/          # Load generator binary
 │   ├── controller/      # Orchestration binary
-│   ├── preflight/       # DNS/TLS/API health checks for rpc_urls
-│   ├── prefund/         # Prefund estimator (fees enabled)
 │   └── keygen/          # Key generation utility (optional)
 ├── config/              # Example TOML configurations
 ├── scripts/             # Helper scripts for running tests
