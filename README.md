@@ -277,6 +277,15 @@ Success response should include:
 Error response:
 - Non-2xx status or JSON body with `code`/`error`/`message` fields
 
+## Cluster ingress (your setup)
+
+For a 4-ingress setup, configure:
+
+- `http://api1.ippan.uk:8080`
+- `http://api2.ippan.uk:8080`
+- `http://api3.ippan.uk:8080`
+- `http://api4.ippan.uk:8080`
+
 ## Next Steps: Tuning
 
 To push higher TPS on a single bot server, tune:
